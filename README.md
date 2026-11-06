@@ -20,9 +20,12 @@ ACP 转发 + 模型网关约定 + 闭源 CLI 首次启动下载。做新 Agent �
 4. **启动 ACP 转发**：在 `$WONTON_ACP_SOCKET`（默认 `/data/run/acp.sock`）监听；每个连接
    起一次 `[acp] command`（stdio 说 ACP）双向转发，连接断了杀掉子进程；转发时去掉终端
    配色码（`[acp] strip_ansi = false` 可关）；子进程 stderr 直接进容器日志。
+5. **终端登录**（`[[login]]`，可选）：配了才有。initialize 应答里的 authMethods 改写成这些
+   终端登录，并在 `<ACP socket 去掉扩展名>.login.sock`（默认 `/data/run/acp.login.sock`）
+   跑登录进程；登录成功后入口自己退出，容器按 restart 策略重启，钩子按新登录态重新选路。
 
 socket 在前面几步全部成功之后才建，compose 的健康检查以 socket 文件为准——socket 不存在
-就是还没就绪（首启下载 CLI 可能要几分钟），桥和核心会重试。`[acp] command` 的可执行文件
+就是还没就绪（首启下载 CLI 可能要几分钟），桥和核心会重试。`[acp]`/`[[login]]` 命令的可执行文件
 在监听之前就校验，起不来直接退出，健康检查不会带着坏配置变绿。
 
 ## agent.toml
@@ -84,6 +87,33 @@ target = "~/.agents/skills"
 见上面完整例子。`[acp] command` 直接指向数据卷里的安装位置；容器重建（升级、网关就绪）
 时数据卷还在，不会重下。
 
+### 终端登录：[[login]]
+
+Claude Code、CodeBuddy Code 这类要终端登录的 CLI 用（可选，可多段）。有这段时，ACP
+initialize 应答里的 authMethods 会改成这些登录（`type` 都是 `terminal`），聊天里的
+`/wonton login <id>` 由桥转成对登录 socket 的请求，入口按配置起登录命令：
+
+```toml
+[[login]]
+id = "chatgpt"                         # /wonton login <id> 用它；字母数字点下划线连字符，不重复
+name = "ChatGPT 账号（设备码）"          # 聊天里列出的名字
+command = ["/usr/local/bin/codex", "login", "--device-auth"]
+stdin = "lines"                        # 缺省 lines：桥发的每行原样转给进程。
+                                       # line_then_eof：转第一行后关 stdin（读 stdin 到 EOF 才
+                                       # 收 key 的 CLI）；桥照旧保持连接收输出。
+restart_on_success = true              # 缺省 true：退出码 0 时回完 exit 帧等 2 秒入口退出，
+                                       # 容器按 restart 策略重启，钩子按新登录态重新选路
+```
+
+入口同时在 `<ACP socket 去掉扩展名>.login.sock`（默认 `/data/run/acp.login.sock`，0600）
+监听，协议和桥的约定一致：桥先发一行 `{"methodId","args","env"}`，按 `methodId` 找到
+`[[login]]` 段（请求里的 `args` 忽略，只用配置里的 `command`；`env` 合并进环境）；
+之后桥发的每行文本写进登录进程 stdin，登录进程 stdout/stderr 每行去配色码回
+`{"out"}`/`{"err"}`，输出收完回 `{"exit": 数字}`。桥断开时登录进程被收掉（stdin 关掉等
+2 秒，terminate 2 秒，kill）；登录串行，一次一个。没有 `[[login]]` 时登录 socket 不建，
+Agent 自己的 agent 类登录照旧走 ACP authenticate。
+
+
 ## 模型网关钩子
 
 钩子是子镜像提供的可执行文件，底座带着全部环境变量调它：
@@ -142,21 +172,27 @@ services:
 
 ## 样例：examples/echo-agent
 
-最小 ACP Agent（回显 prompt）+ `agent.toml` + `Dockerfile`，演示 skill 安装和网关钩子。
-本机验证（构建底座和样例、起容器、连 socket 发 `initialize` 和一次 `session/prompt`）：
+最小 ACP Agent（回显 prompt）+ `agent.toml` + `Dockerfile`，演示 skill 安装、网关钩子和
+`[[login]]`。本机验证（构建底座和样例、起容器、连 socket 发 `initialize` 和一次
+`session/prompt`，再跑一次样例登录）：
 
 ```sh
 docker build -t ab-agent-base:0.1.0 .
 docker build -t ab-echo-agent:0.1.0 examples/echo-agent \
     --build-arg BASE_IMAGE=ab-agent-base:0.1.0
 docker run -d --name ab-echo-test ab-echo-agent:0.1.0
-# 等几秒后连 /data/run/acp.sock 发 ACP 消息，拿回显；测完 docker rm -f ab-echo-test
+# 等几秒后连 /data/run/acp.sock 发 ACP 消息，拿回显。
+# 连 /data/run/acp.login.sock 发一行 {"methodId":"sample","args":[],"env":{}} 加一行 key，
+# 拿回 {"out":"logged in"} 和 {"exit":0}；样例 restart_on_success 用缺省 true，
+# 容器随后自己退出（退出码 0）。
+# 测完 docker rm -f ab-echo-test
 ```
 
 ## 测试和发布
 
 - `tests/` 是 Python unittest（只用标准库，不连外网，假 HTTP 服务装包）：配置解析、
-  网关 apply/clear、npm 和 URL 两种安装的摘要通过/失败、同版本不重下、socket 往返。
+  网关 apply/clear、npm 和 URL 两种安装的摘要通过/失败、同版本不重下、socket 往返、
+  登录 socket（lines / line_then_eof / 未知 id / 桥断开收进程 / 成功后入口退出）。
   `python3 -m unittest discover -s tests -v`
 - 发布：GitHub Actions 手动触发（**发布** → Run workflow），先跑测试再出 amd64+arm64
   镜像，推 `ghcr.io/geraldpeng6/wonton-agent-base:<VERSION>`，版本号在仓库根 `VERSION`。
@@ -165,10 +201,10 @@ docker run -d --name ab-echo-test ab-echo-agent:0.1.0
 
 - **闭源 CLI 不打进发布的镜像**：底座镜像和摘要要能公开复现，闭源 CLI 从官方源按版本和
   摘要核对后下载到数据卷，由 agent.toml 声明。
-- **codex 的两段专用逻辑不在底座里**：`rewrite_auth_methods`（initialize 应答把登录方式
-  改写成终端登录）和 `serve_login`（第二个 socket 跑终端登录进程）绑定 codex 的登录命令
-  和桥的登录协议，且没有桥就无法端到端验证。留在 wonton-plugin-codex 自己的入口里；
-  等第二个需要终端登录的 Agent 出现，再把通用部分提上来。
+- **终端登录是配置不是代码**：登录命令各家 CLI 不同，底座只做通用搬运——initialize 应答
+  的 authMethods 改写、登录 socket 协议、stdin/stdout/stderr 逐行去配色码、串行、成功后
+  重启容器——具体命令、stdin 模式、是否重启都由 agent.toml 的 `[[login]]` 声明；底座不
+  认识任何一家的登录命令，桥请求里的 `args` 一律忽略。没有 `[[login]]` 时这一切不生效。
 - **skill 每次覆盖、不清理旧文件**：HOME 是挂载点，镜像里的内容拷不进去，只能启动时铺；
   照搬 wonton-plugin-codex 的既有行为。
 - **socket 权限 0600**：只有桥和宿主诊断连得上。

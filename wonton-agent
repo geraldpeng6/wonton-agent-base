@@ -14,13 +14,15 @@
    socket 在前面几步都成功之后才建，compose 的健康检查以 socket 文件为准，建好之前不过。
    收到 SIGTERM/SIGINT 优雅退出：给活着的 ACP 子进程 terminate（5 秒后 kill）、删 socket、
    退出码 0，docker stop 不用等满 10 秒的 SIGKILL。
-
-codex 插件特有的 rewrite_auth_methods（initialize 应答改写登录方式）和 serve_login（终端登录
-socket）依赖 codex 的登录命令和桥的登录协议，留在 wonton-plugin-codex 自己的入口里，见 README。
+5. [[login]]（可选，可多段）：终端登录。把 initialize 应答里的 authMethods 改写成这些登录，
+   并在 ACP socket 旁边监听 <ACP socket 去掉扩展名>.login.sock：桥连上来发一行
+   {"methodId","args","env"}，入口按 agent.toml 里配的命令起登录进程，双向搬运
+   stdin/stdout/stderr（每行去配色码），登录成功后入口自己退出，容器按 restart 策略重启。
 """
 import asyncio
 import base64
 import hashlib
+import json
 import os
 import platform
 import re
@@ -44,6 +46,11 @@ GATEWAY_ENV = ("WONTON_MODEL_BASE_URL", "WONTON_MODEL_API_KEY", "WONTON_MODEL_DE
 SOCKET = Path(os.environ.get("WONTON_ACP_SOCKET", "/data/run/acp.sock"))
 WORKSPACE = Path(os.environ.get("WONTON_AGENT_WORKSPACE", "/workspace"))
 AGENT_HOME = Path(os.environ.get("HOME", "/data/agent/home"))
+
+# 登录成功回完 exit 帧等这么久再退出入口，让桥收尾；桥断开时 stdin 关掉等这么久，
+# terminate 再等这么久，最后 kill。测试里调短，不必等满 2 秒。
+RESTART_DELAY = 2
+DISCONNECT_GRACE = 2
 
 # 桥把终端登录的链接和提示原样发进聊天：去掉终端配色码（照搬 wonton-plugin-codex）。
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -71,11 +78,12 @@ def load_config(path: Path = CONFIG_PATH) -> dict:
         die(f"找不到配置 {path}：子镜像要 COPY agent.toml /etc/wonton-agent/")
     except tomllib.TOMLDecodeError as error:
         die(f"配置 {path} 不是合法 TOML：{error}")
-    unknown = set(config) - {"install", "skills", "prompt", "gateway", "acp"}
+    unknown = set(config) - {"install", "skills", "prompt", "gateway", "acp", "login"}
     if unknown:
         die(f"配置 {path} 有不认识的段 {'、'.join(sorted(unknown))}，检查字段名有没有拼错")
     validate_acp(config.get("acp"))
     validate_installs(config.get("install", []))
+    validate_logins(config.get("login", []))
     for section in ("skills", "prompt"):
         if section in config and not isinstance(config[section].get("target"), str):
             die(f"配置 [{section}] 缺 target（字符串路径）")
@@ -124,6 +132,38 @@ def validate_installs(items: list) -> None:
                 die(f"[[install]] {name} 的 format 只能是 binary（单个可执行文件）或 tgz（解包安装）")
         else:
             die(f"[[install]] {name} 的 source 只能是 npm 或 url")
+
+
+def validate_logins(items: list) -> None:
+    if not isinstance(items, list):
+        die("配置 [[login]] 必须是列表（每个终端登录一段）")
+    seen: set[str] = set()
+    for item in items:
+        login_id = item.get("id")
+        if not isinstance(login_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", login_id):
+            die(f"[[login]] 的 id 非法：{login_id!r}（聊天里 /wonton login 用，只允许字母数字点下划线连字符）")
+        if login_id in seen:
+            die(f"[[login]] 的 id 重复：{login_id}")
+        seen.add(login_id)
+        if not isinstance(item.get("name"), str) or not item["name"]:
+            die(f"[[login]] {login_id} 缺 name（聊天里列出的名字）")
+        command = item.get("command")
+        if not isinstance(command, list) or not command or not all(isinstance(a, str) and a for a in command):
+            die(f'[[login]] {login_id} command 必须是非空字符串列表，例如 command = ["/usr/local/bin/foo", "login"]')
+        if item.get("stdin", "lines") not in ("lines", "line_then_eof"):
+            die(f"[[login]] {login_id} 的 stdin 只能是 lines（缺省，桥发的每行原样转给进程）"
+                "或 line_then_eof（转第一行后关 stdin，给读 stdin 到 EOF 收 key 的 CLI）")
+        if not isinstance(item.get("restart_on_success", True), bool):
+            die(f"[[login]] {login_id} 的 restart_on_success 必须是布尔值（缺省 true：登录成功后重启容器）")
+
+
+def login_methods(config: dict) -> list[dict] | None:
+    """[[login]] 要改写成的 authMethods；没有这段时返回 None，转发保持原样。"""
+    logins = config.get("login")
+    if not logins:
+        return None
+    return [{"id": section["id"], "name": section["name"], "type": "terminal", "args": []}
+            for section in logins]
 
 
 def parse_integrity(value: str) -> tuple[str, str]:
@@ -284,8 +324,24 @@ def apply_gateway(config: dict) -> None:
 # ---------- ACP 转发 ----------
 
 
-async def relay(client: socket.socket, process: asyncio.subprocess.Process, strip_ansi: bool) -> None:
-    """双向转发，照搬 wonton-plugin-codex 的 relay：socket↔子进程 stdio，逐行去配色码。"""
+def rewrite_auth_methods(line: str, methods: list[dict]) -> str:
+    """有 [[login]] 时把 initialize 应答（result 里带 authMethods 的那行）改写成配置的终端登录，
+    其余行原样过（照搬 wonton-plugin-codex 的 rewrite_auth_methods）。改写后的行要补回换行：
+    ACP 和桥都按行读 JSON，丢了行尾对端就一直等。"""
+    try:
+        message = json.loads(line)
+    except ValueError:
+        return line
+    if isinstance(message, dict) and isinstance(message.get("result"), dict) \
+            and "authMethods" in message["result"]:
+        message["result"]["authMethods"] = methods
+        return json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n"
+    return line
+
+
+async def relay(client: socket.socket, process: asyncio.subprocess.Process,
+                strip_ansi: bool, methods: list[dict] | None) -> None:
+    """双向转发：socket↔子进程 stdio，逐行去配色码；有 [[login]] 时改写 authMethods。"""
     loop = asyncio.get_running_loop()
 
     async def socket_to_agent() -> None:
@@ -297,9 +353,15 @@ async def relay(client: socket.socket, process: asyncio.subprocess.Process, stri
 
     async def agent_to_socket() -> None:
         while line := await process.stdout.readline():
+            if not (strip_ansi or methods):
+                await loop.sock_sendall(client, line)
+                continue
+            text = line.decode(errors="replace")
             if strip_ansi:
-                line = ANSI.sub("", line.decode(errors="replace")).encode()
-            await loop.sock_sendall(client, line)
+                text = ANSI.sub("", text)
+            if methods:
+                text = rewrite_auth_methods(text, methods)
+            await loop.sock_sendall(client, text.encode())
 
     tasks = [asyncio.create_task(socket_to_agent()), asyncio.create_task(agent_to_socket())]
     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -323,9 +385,9 @@ async def stop_process(process: asyncio.subprocess.Process) -> None:
 
 
 async def run_connection(client: socket.socket, process: asyncio.subprocess.Process,
-                         strip_ansi: bool, children: set) -> None:
+                         strip_ansi: bool, methods: list[dict] | None, children: set) -> None:
     try:
-        await relay(client, process, strip_ansi)
+        await relay(client, process, strip_ansi, methods)
     except (OSError, ValueError):
         pass  # 对端断开时的竞态（BrokenPipe 等），子进程在下面统一收掉
     finally:
@@ -336,29 +398,48 @@ async def run_connection(client: socket.socket, process: asyncio.subprocess.Proc
             await stop_process(process)
 
 
+def listen_unix(path: Path, backlog: int) -> socket.socket:
+    """建 unix 监听 socket，权限 0600：只有桥和宿主诊断连得上。"""
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(path))
+    os.chmod(path, 0o600)
+    listener.listen(backlog)
+    listener.setblocking(False)
+    return listener
+
+
 async def serve(config: dict) -> None:
     command = config["acp"]["command"]
     strip_ansi = config["acp"].get("strip_ansi", True)
+    methods = login_methods(config)
     # 起不来是子镜像配置坏了：在监听之前就报错，健康检查不过，别等第一个连接才暴露。
     if not shutil.which(command[0]):
         raise RuntimeError(
             f"ACP 命令 {command[0]} 不存在或不可执行：检查 [acp] command，或 [install] 是否装到位")
+    for section in config.get("login", []):
+        if not shutil.which(section["command"][0]):
+            raise RuntimeError(
+                f"[[login]] {section['id']} 的命令 {section['command'][0]} 不存在或不可执行："
+                "检查 [[login]] command，或 [install] 是否装到位")
     for directory in (AGENT_HOME, WORKSPACE, SOCKET.parent):
         directory.mkdir(parents=True, exist_ok=True)
-    try:
-        SOCKET.unlink()
-    except FileNotFoundError:
-        pass
-    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    listener.bind(str(SOCKET))
-    # 只有桥和宿主诊断连：不给组和其他人。
-    os.chmod(SOCKET, 0o600)
-    listener.listen(8)
-    listener.setblocking(False)
-    log(f"ACP 转发就绪：{SOCKET} -> {command[0]}")
     loop = asyncio.get_running_loop()
     children: set[asyncio.subprocess.Process] = set()
+    # 登录 socket 在 ACP socket 之前建好（健康检查看的是 ACP socket）；没有 [[login]] 就不建。
+    login_socket = SOCKET.with_suffix(".login.sock") if methods else None
+    listener = login_listener = login_task = None
     try:
+        if login_socket:
+            login_listener = listen_unix(login_socket, 2)
+        listener = listen_unix(SOCKET, 8)
+        log(f"ACP 转发就绪：{SOCKET} -> {command[0]}")
+        if login_listener:
+            login_task = asyncio.create_task(serve_login(login_listener, config["login"]))
+            log(f"终端登录就绪：{login_socket}（{'、'.join(s['id'] for s in config['login'])}）")
         while True:
             client, _ = await loop.sock_accept(listener)
             client.setblocking(False)
@@ -378,15 +459,149 @@ async def serve(config: dict) -> None:
                 # 命令起不来是子镜像配置坏了，重试连接不会好：退出让核心看到失败。
                 raise RuntimeError(f"启动 ACP 命令 {command} 失败：{error}") from error
             children.add(process)
-            asyncio.create_task(run_connection(client, process, strip_ansi, children))
+            asyncio.create_task(run_connection(client, process, strip_ansi, methods, children))
     finally:
-        listener.close()
-        try:
-            SOCKET.unlink()
-        except FileNotFoundError:
-            pass
+        if login_task:
+            login_task.cancel()
+            await asyncio.gather(login_task, return_exceptions=True)
+        for sock in (listener, login_listener):
+            if sock:
+                sock.close()
+        for path in (SOCKET, login_socket):
+            if path:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
         # 正常不走到这（收到 SIGTERM 被取消时才走）：把还活着的子进程收干净再退。
         await asyncio.gather(*(stop_process(process) for process in children))
+
+
+# ---------- 终端登录 ----------
+
+
+async def send_frame(client: socket.socket, loop: asyncio.AbstractEventLoop, frame: dict) -> None:
+    await loop.sock_sendall(client, (json.dumps(frame, ensure_ascii=False) + "\n").encode())
+
+
+async def serve_login(listener: socket.socket, logins: list[dict]) -> None:
+    """终端类登录：桥连这个 socket，入口按 [[login]] 配置起登录进程并搬运 stdio。
+
+    协议（与桥 login/terminal.rs 约定）：桥先发一行 JSON {"methodId","args","env"}；methodId
+    对上哪段 [[login]] 就用哪段的 command 和 stdin 模式（请求里的 args 忽略），env 合并进环境。
+    之后桥发的每行文本写入登录进程 stdin；登录进程的 stdout/stderr 每行去配色码回
+    {"out"}/{"err"}，输出收完回 {"exit": 数字}，0 才算成功。登录串行，一次一个，后来的在
+    backlog 里等。
+    """
+    loop = asyncio.get_running_loop()
+    while True:
+        client, _ = await loop.sock_accept(listener)
+        try:
+            await relay_login(client, loop, logins)
+        except OSError:
+            pass  # 桥断开或登录进程死了的竞态（BrokenPipe 等）：这次登录作废，串行继续。
+        finally:
+            client.close()
+
+
+async def relay_login(client: socket.socket, loop: asyncio.AbstractEventLoop,
+                      logins: list[dict]) -> None:
+    reader = asyncio.StreamReader()
+    await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), client.makefile("rb"))
+    request_line = await reader.readline()
+    if not request_line:
+        return
+    try:
+        request = json.loads(request_line)
+    except ValueError:
+        request = None
+    if not isinstance(request, dict):
+        await send_frame(client, loop, {"err": "登录请求第一行要是 JSON 对象"})
+        await send_frame(client, loop, {"exit": 2})
+        return
+    section = next((s for s in logins if s["id"] == request.get("methodId")), None)
+    if section is None:
+        await send_frame(client, loop, {"err": f"没有这种登录方式：{request.get('methodId')}"})
+        await send_frame(client, loop, {"exit": 2})
+        return
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *section["command"],
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, **request.get("env", {})},
+            cwd=WORKSPACE,
+        )
+    except OSError as error:
+        await send_frame(client, loop, {"err": f"启动登录命令 {section['command']} 失败：{error}"})
+        await send_frame(client, loop, {"exit": 1})
+        return
+    stdin = process.stdin
+
+    async def pump_output(stream: asyncio.StreamReader, key: str) -> None:
+        while line := await stream.readline():
+            await send_frame(client, loop, {key: ANSI.sub("", line.decode(errors="replace")).rstrip("\n")})
+
+    async def pump_input() -> None:
+        while line := await reader.readline():
+            stdin.write(line)
+            await stdin.drain()
+
+    stdout_task = asyncio.create_task(pump_output(process.stdout, "out"))
+    stderr_task = asyncio.create_task(pump_output(process.stderr, "err"))
+    if section.get("stdin", "lines") == "line_then_eof":
+        # 读 stdin 到 EOF 才收 key 的 CLI：转第一行后关掉登录进程的 stdin 制造 EOF，
+        # 桥那边照旧保持连接收输出帧（照搬 codex 入口）。
+        line = await reader.readline()
+        if not line:
+            # 桥没发内容就断开（取消、超时）：结束登录进程，收回这次串行的登录。
+            code = await end_login_process(process)
+        else:
+            stdin.write(line)
+            await stdin.drain()
+            stdin.close()
+            code = await process.wait()
+        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+    else:
+        input_task = asyncio.create_task(pump_input())
+        exit_task = asyncio.create_task(process.wait())
+        done, _ = await asyncio.wait({exit_task, input_task}, return_when=asyncio.FIRST_COMPLETED)
+        if input_task in done:
+            # 桥断开（取消、超时、桥退出）：登录进程可能还在等 stdin，必须结束并收回，
+            # 否则串行的 serve_login 会一直卡在这次登录上。
+            code = await end_login_process(process)
+        else:
+            code = exit_task.result()
+        input_task.cancel()
+        await asyncio.gather(stdout_task, stderr_task, exit_task, input_task, return_exceptions=True)
+    # 输出泵收完才发退出帧：桥收到 exit 就停读，"Successfully logged in" 和失败原因
+    # 不能跟退出帧竞态。
+    try:
+        await send_frame(client, loop, {"exit": code})
+    except OSError:
+        return
+    if code == 0 and section.get("restart_on_success", True):
+        # 登录态已写进数据卷。等桥收尾，然后退出整个入口，容器按 restart 策略重启，
+        # 钩子按新登录态重新选路（照搬 codex 入口）。
+        await asyncio.sleep(RESTART_DELAY)
+        os._exit(0)
+
+
+async def end_login_process(process: asyncio.subprocess.Process) -> int:
+    """桥断开：stdin 关掉等 2 秒，terminate 等 2 秒，还不退就 kill。返回退出码。"""
+    if process.stdin is not None:
+        process.stdin.close()
+    try:
+        return await asyncio.wait_for(process.wait(), DISCONNECT_GRACE)
+    except asyncio.TimeoutError:
+        pass
+    process.terminate()
+    try:
+        return await asyncio.wait_for(process.wait(), DISCONNECT_GRACE)
+    except asyncio.TimeoutError:
+        process.kill()
+        return await process.wait()
 
 
 def shutdown(signum: int, frame: object) -> None:

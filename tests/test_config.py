@@ -144,6 +144,52 @@ class LoadConfigTests(unittest.TestCase):
         self.assertIsNone(message)
         self.assertEqual(config["install"][0]["name"], "foo")
 
+    def test_login_section_parses_with_defaults(self):
+        config, message = load('[acp]\ncommand = ["x"]\n\n[[login]]\nid = "chatgpt"\n'
+                               'name = "ChatGPT 账号（设备码）"\n'
+                               'command = ["/usr/local/bin/codex", "login", "--device-auth"]\n')
+        self.assertIsNone(message)
+        section = config["login"][0]
+        # stdin / restart_on_success 缺省在用时取（lines、true），解析结果没有这个键。
+        self.assertEqual(section.get("stdin", "lines"), "lines")
+        self.assertIs(section.get("restart_on_success", True), True)
+
+    def test_login_multiple_sections_parse(self):
+        config, message = load('[acp]\ncommand = ["x"]\n\n[[login]]\nid = "a"\nname = "A"\ncommand = ["/a"]\n'
+                               '[[login]]\nid = "b"\nname = "B"\ncommand = ["/b"]\nstdin = "line_then_eof"\n'
+                               'restart_on_success = false\n')
+        self.assertIsNone(message)
+        self.assertEqual([s["id"] for s in config["login"]], ["a", "b"])
+        self.assertEqual(config["login"][1]["stdin"], "line_then_eof")
+        self.assertIs(config["login"][1]["restart_on_success"], False)
+
+    def test_login_bad_id_rejected(self):
+        _, message = load('[acp]\ncommand = ["x"]\n\n[[login]]\nid = "../evil"\nname = "A"\ncommand = ["/a"]\n')
+        self.assertIn("id", message)
+
+    def test_login_duplicate_id_rejected(self):
+        _, message = load('[acp]\ncommand = ["x"]\n\n[[login]]\nid = "a"\nname = "A"\ncommand = ["/a"]\n'
+                          '[[login]]\nid = "a"\nname = "A2"\ncommand = ["/a2"]\n')
+        self.assertIn("重复", message)
+
+    def test_login_missing_name_rejected(self):
+        _, message = load('[acp]\ncommand = ["x"]\n\n[[login]]\nid = "a"\ncommand = ["/a"]\n')
+        self.assertIn("name", message)
+
+    def test_login_empty_command_rejected(self):
+        _, message = load('[acp]\ncommand = ["x"]\n\n[[login]]\nid = "a"\nname = "A"\ncommand = []\n')
+        self.assertIn("command", message)
+
+    def test_login_bad_stdin_rejected(self):
+        _, message = load('[acp]\ncommand = ["x"]\n\n[[login]]\nid = "a"\nname = "A"\ncommand = ["/a"]\n'
+                          'stdin = "bytes"\n')
+        self.assertIn("stdin", message)
+
+    def test_login_bad_restart_rejected(self):
+        _, message = load('[acp]\ncommand = ["x"]\n\n[[login]]\nid = "a"\nname = "A"\ncommand = ["/a"]\n'
+                          'restart_on_success = "yes"\n')
+        self.assertIn("restart_on_success", message)
+
     def test_invalid_toml_rejected(self):
         stderr = StringIO()
         with redirect_stderr(stderr):

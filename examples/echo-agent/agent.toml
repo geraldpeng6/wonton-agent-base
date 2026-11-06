@@ -7,3 +7,9 @@ target = "~/.agents/skills"
 
 [gateway]
 hook = "/usr/local/lib/wonton-agent/gateway"
+
+# 最小终端登录样例：读一行当 key，打印 logged in 退出 0；成功后容器按 restart 策略重启。
+[[login]]
+id = "sample"
+name = "样例账号（读一行 key）"
+command = ["/bin/sh", "/usr/local/lib/wonton-agent/login"]

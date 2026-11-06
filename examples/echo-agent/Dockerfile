@@ -5,5 +5,6 @@ FROM ${BASE_IMAGE}
 COPY agent.toml /etc/wonton-agent/
 COPY --chmod=0755 agent.py /usr/local/bin/echo-agent
 COPY --chmod=0755 gateway /usr/local/lib/wonton-agent/gateway
+COPY --chmod=0755 login /usr/local/lib/wonton-agent/login
 # skill 目录 COPY 整棵树：COPY --chmod 会连自动创建的目录一起改（0644 会丢掉目录的 x 位）。
 COPY skills/ /usr/local/share/wonton-agent/skills/
