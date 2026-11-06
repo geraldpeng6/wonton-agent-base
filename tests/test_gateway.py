@@ -28,7 +28,11 @@ class GatewayTests(unittest.TestCase):
         self.record = self.tmp / "record"
 
     def run_gateway(self, config: dict, env: dict) -> str:
-        with mock.patch.dict(os.environ, env, clear=True):
+        # 不用 clear=True：清掉 PATH 会让钩子的 #!/usr/bin/env python3 找不到解释器；
+        # 缺省变量显式给空串，和核心注入空值的语义一致。
+        values = {"WONTON_MODEL_BASE_URL": "", "WONTON_MODEL_API_KEY": "", "WONTON_MODEL_DEFAULT": ""}
+        values.update(env)
+        with mock.patch.dict(os.environ, values):
             agent.apply_gateway(config)
         return self.record.read_text()
 

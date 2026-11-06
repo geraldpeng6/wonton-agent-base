@@ -22,7 +22,8 @@ ACP 转发 + 模型网关约定 + 闭源 CLI 首次启动下载。做新 Agent �
    配色码（`[acp] strip_ansi = false` 可关）；子进程 stderr 直接进容器日志。
 
 socket 在前面几步全部成功之后才建，compose 的健康检查以 socket 文件为准——socket 不存在
-就是还没就绪（首启下载 CLI 可能要几分钟），桥和核心会重试。
+就是还没就绪（首启下载 CLI 可能要几分钟），桥和核心会重试。`[acp] command` 的可执行文件
+在监听之前就校验，起不来直接退出，健康检查不会带着坏配置变绿。
 
 ## agent.toml
 

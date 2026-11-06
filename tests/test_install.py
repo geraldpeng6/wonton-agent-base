@@ -121,9 +121,10 @@ class InstallTests(unittest.TestCase):
         self.assertTrue((final / "package.json").is_file())
         self.assertTrue((final / "bin" / "echo").is_file())
         # 底座在解包后调 npm install --prefix 装依赖（测试里被 mock 成记录）：
-        # 恰好一次，路径是 staging 目录（随后整体改名成 final）。
+        # 恰好一次，路径是 staging 目录（名字带 download- 标记，随后整体改名成 final）。
         self.assertEqual(len(npm_calls), 1)
         self.assertTrue(npm_calls[0].is_relative_to(self.tools))
+        self.assertIn(".echo-1.0.0.download-", npm_calls[0].name)
         self.assertEqual(registry.requests, ["/@scope/echo/-/echo-1.0.0.tgz"])
 
     def test_npm_hex_integrity_accepted(self):
@@ -155,6 +156,23 @@ class InstallTests(unittest.TestCase):
         with FakeRegistry({}) as registry:
             with self.assertRaises(OSError):
                 agent.install_tools(self.npm_config(sha512_integrity(b"x"), registry.base))
+
+    def test_npm_default_registry_url(self):
+        # registry 省略 = 官方源：mock download 抓 URL，不连外网也锁住缺省 URL 的构造，
+        # 且 sha512 校验照跑（替身写出正确内容让后面的流程走通）。
+        data = npm_package_tgz()
+        captured: list[str] = []
+
+        def fake_download(url: str, target: Path) -> None:
+            captured.append(url)
+            target.write_bytes(data)
+
+        config = {"install": [{"name": "echo", "version": "1.0.0", "source": "npm",
+                               "package": "@scope/echo", "integrity": sha512_integrity(data)}]}
+        with mock.patch.object(agent, "download", fake_download):
+            agent.install_tools(config)
+        self.assertEqual(captured, ["https://registry.npmjs.org/@scope/echo/-/echo-1.0.0.tgz"])
+        self.assertTrue((self.tools / "echo" / "1.0.0" / "package.json").is_file())
 
     def test_url_binary_install(self):
         body = b"#!/bin/sh\necho url-tool\n"
