@@ -1,0 +1,391 @@
+#!/usr/bin/env python3
+"""Wonton Agent 底座入口：按 /etc/wonton-agent/agent.toml 装闭源 CLI、装 skill 和提示、调网关钩子，
+然后在 unix socket 上转发 ACP。Agent 插件的子镜像只写 agent.toml（和自己的钩子）。
+
+每次容器启动依次：
+1. [install]（可选）：闭源 CLI 不打进发布的镜像，首次启动从官方源下载到数据卷
+   /data/agent/tools/<名字>/<版本>/；版本目录已存在就不重下，校验失败报错退出。
+2. [skills]/[prompt]（可选）：把镜像里 /usr/local/share/wonton-agent/ 下的内容拷到 agent.toml
+   指定的目录，每次启动覆盖。
+3. [gateway]（可选）：核心注入的 WONTON_MODEL_* 变量都有值时调钩子 apply，任一为空调 clear；
+   网关后来就绪时核心会重建容器，钩子在新一轮启动里生效。密钥只引用变量名，不写进文件。
+4. [acp]：在 $WONTON_ACP_SOCKET 上监听，每个连接起一次 ACP 命令（stdio 说 ACP）双向转发，
+   连接断了杀掉子进程。转发时去掉终端配色码；子进程 stderr 直接进容器日志。
+   socket 在前面几步都成功之后才建，compose 的健康检查以 socket 文件为准，建好之前不过。
+
+codex 插件特有的 rewrite_auth_methods（initialize 应答改写登录方式）和 serve_login（终端登录
+socket）依赖 codex 的登录命令和桥的登录协议，留在 wonton-plugin-codex 自己的入口里，见 README。
+"""
+import asyncio
+import base64
+import hashlib
+import os
+import platform
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tarfile
+import tomllib
+import urllib.request
+from pathlib import Path
+
+CONFIG_PATH = Path("/etc/wonton-agent/agent.toml")
+SKILL_SOURCE = Path("/usr/local/share/wonton-agent/skills")
+PROMPT_SOURCE = Path("/usr/local/share/wonton-agent/prompt.md")
+TOOLS_ROOT = Path("/data/agent/tools")
+NPM_REGISTRY = "https://registry.npmjs.org"
+GATEWAY_ENV = ("WONTON_MODEL_BASE_URL", "WONTON_MODEL_API_KEY", "WONTON_MODEL_DEFAULT")
+
+SOCKET = Path(os.environ.get("WONTON_ACP_SOCKET", "/data/run/acp.sock"))
+WORKSPACE = Path(os.environ.get("WONTON_AGENT_WORKSPACE", "/workspace"))
+AGENT_HOME = Path(os.environ.get("HOME", "/data/agent/home"))
+
+# 桥把终端登录的链接和提示原样发进聊天：去掉终端配色码（照搬 wonton-plugin-codex）。
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+HEX_SHA512 = re.compile(r"[0-9a-fA-F]{128}\Z")
+HEX_SHA256 = re.compile(r"[0-9a-fA-F]{64}\Z")
+
+
+def log(message: str) -> None:
+    print(f"[wonton-agent] {message}", file=sys.stderr, flush=True)
+
+
+def die(message: str) -> None:
+    log(message)
+    sys.exit(1)
+
+
+# ---------- 配置 ----------
+
+
+def load_config(path: Path = CONFIG_PATH) -> dict:
+    try:
+        with open(path, "rb") as file:
+            config = tomllib.load(file)
+    except FileNotFoundError:
+        die(f"找不到配置 {path}：子镜像要 COPY agent.toml /etc/wonton-agent/")
+    except tomllib.TOMLDecodeError as error:
+        die(f"配置 {path} 不是合法 TOML：{error}")
+    unknown = set(config) - {"install", "skills", "prompt", "gateway", "acp"}
+    if unknown:
+        die(f"配置 {path} 有不认识的段 {'、'.join(sorted(unknown))}，检查字段名有没有拼错")
+    validate_acp(config.get("acp"))
+    validate_installs(config.get("install", []))
+    for section in ("skills", "prompt"):
+        if section in config and not isinstance(config[section].get("target"), str):
+            die(f"配置 [{section}] 缺 target（字符串路径）")
+    if "gateway" in config and not isinstance(config["gateway"].get("hook"), str):
+        die("配置 [gateway] 缺 hook（可执行文件路径）")
+    return config
+
+
+def validate_acp(section: dict | None) -> None:
+    if not isinstance(section, dict):
+        die('配置缺 [acp]：至少要写 command = ["ACP 命令", ...]')
+    command = section.get("command")
+    if not isinstance(command, list) or not command or not all(isinstance(a, str) and a for a in command):
+        die('[acp] command 必须是非空字符串列表，例如 command = ["/usr/local/bin/foo-acp"]')
+    if not isinstance(section.get("strip_ansi", True), bool):
+        die("[acp] strip_ansi 必须是布尔值（缺省 true：转发时去掉终端配色码）")
+
+
+def validate_installs(items: list) -> None:
+    if not isinstance(items, list):
+        die("配置 [[install]] 必须是列表（每个闭源 CLI 一段）")
+    for item in items:
+        name = item.get("name")
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
+            die(f"[[install]] 的 name 非法：{name!r}（只允许字母数字点下划线连字符，不能有路径分隔符）")
+        if not isinstance(item.get("version"), str) or not item["version"]:
+            die(f"[[install]] {name} 缺 version")
+        source = item.get("source")
+        if source == "npm":
+            if not isinstance(item.get("package"), str) or not item["package"]:
+                die(f"[[install]] {name} 缺 package（npm 包名）")
+            try:
+                parse_integrity(item.get("integrity", ""))
+            except ValueError as error:
+                die(f"[[install]] {name} 的 integrity 非法：{error}")
+            registry = item.get("registry", NPM_REGISTRY)
+            if not isinstance(registry, str) or not registry.startswith(("http://", "https://")):
+                die(f"[[install]] {name} 的 registry 必须是 http(s) 地址")
+        elif source == "url":
+            for field in ("url_amd64", "url_arm64", "sha256_amd64", "sha256_arm64"):
+                if not isinstance(item.get(field), str) or not item[field]:
+                    die(f"[[install]] {name} 缺 {field}（按架构给下载地址和 sha256）")
+            if not HEX_SHA256.fullmatch(item["sha256_amd64"]) or not HEX_SHA256.fullmatch(item["sha256_arm64"]):
+                die(f"[[install]] {name} 的 sha256_amd64/sha256_arm64 必须是 64 位十六进制")
+            if item.get("format", "binary") not in ("binary", "tgz"):
+                die(f"[[install]] {name} 的 format 只能是 binary（单个可执行文件）或 tgz（解包安装）")
+        else:
+            die(f"[[install]] {name} 的 source 只能是 npm 或 url")
+
+
+def parse_integrity(value: str) -> tuple[str, str]:
+    """npm 的 integrity 是 sha512-<base64>；插件里也常用十六进制（照 codex 插件的 Dockerfile）。"""
+    if value.startswith("sha512-"):
+        return "sha512", base64.b64decode(value[len("sha512-"):]).hex()
+    if HEX_SHA512.fullmatch(value):
+        return "sha512", value.lower()
+    raise ValueError("要 sha512-<base64>（npm dist.integrity）或 128 位十六进制")
+
+
+# ---------- 按需安装 ----------
+
+
+def current_arch() -> str:
+    return {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine(), platform.machine())
+
+
+def verify_digest(item_name: str, path: Path, algo: str, expected_hex: str) -> None:
+    actual = hashlib.new(algo, path.read_bytes()).hexdigest()
+    if actual != expected_hex.lower():
+        raise RuntimeError(
+            f"安装 {item_name}：下载文件摘要不符，期望 {algo}:{expected_hex.lower()}，实际 {algo}:{actual}。"
+            "可能是上游改了文件或下载被调包，拒绝安装。")
+
+
+def download(url: str, target: Path) -> None:
+    # 代理由核心注入（HTTPS_PROXY 等环境变量），urllib 自己遵守，不另写代理。
+    request = urllib.request.Request(url, headers={"User-Agent": "wonton-agent"})
+    with urllib.request.urlopen(request) as response, open(target, "wb") as file:
+        shutil.copyfileobj(response, file)
+
+
+def npm_install(prefix: Path) -> None:
+    # --ignore-scripts：不执行包里的安装脚本。npm 读容器里的代理变量出网。
+    result = subprocess.run(
+        ["npm", "install", "--prefix", str(prefix), "--ignore-scripts", "--no-audit", "--no-fund",
+         "--loglevel=error"],
+        stdin=subprocess.DEVNULL,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"npm install --prefix {prefix} 失败（退出码 {result.returncode}），看上面日志")
+
+
+def install_tools(config: dict) -> None:
+    for item in config.get("install", []):
+        name, version = item["name"], item["version"]
+        final = TOOLS_ROOT / name / version
+        if final.is_dir():
+            log(f"安装 {name}：{version} 已在 {final}，跳过下载")
+            continue
+        for stale in TOOLS_ROOT.glob(f".{name}-*.download-*"):
+            shutil.rmtree(stale, ignore_errors=True)
+        staging = TOOLS_ROOT / f".{name}-{version}.download-{os.getpid()}"
+        staging.mkdir(parents=True)
+        try:
+            if item["source"] == "npm":
+                install_npm_package(item, staging)
+            else:
+                install_url_package(item, staging)
+            final.parent.mkdir(parents=True, exist_ok=True)
+            staging.rename(final)
+            log(f"安装 {name}：{version} 装到 {final}")
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+def install_npm_package(item: dict, staging: Path) -> None:
+    name, package = item["name"], item["package"]
+    filename = package.split("/")[-1]
+    registry = item.get("registry", NPM_REGISTRY).rstrip("/")
+    url = f"{registry}/{package}/-/{filename}-{item['version']}.tgz"
+    archive = staging / "package.tgz"
+    log(f"安装 {name}：从 {url} 下载 npm 包")
+    download(url, archive)
+    algo, expected = parse_integrity(item["integrity"])
+    verify_digest(name, archive, algo, expected)
+    try:
+        with tarfile.open(archive, "r:gz") as tar:
+            # filter="data"：拒绝包内路径穿越和特殊权限位。
+            tar.extractall(staging, filter="data")
+    except tarfile.TarError as error:
+        raise RuntimeError(f"安装 {name}：下载的 npm 包不是合法 tgz（{error}）") from error
+    extracted = staging / "package"
+    if not (extracted / "package.json").is_file():
+        raise RuntimeError(f"安装 {name}：npm 包里没有 package/package.json，不是合法的包")
+    for child in extracted.iterdir():
+        shutil.move(str(child), staging / child.name)
+    extracted.rmdir()
+    archive.unlink()
+    npm_install(staging)
+
+
+def install_url_package(item: dict, staging: Path) -> None:
+    name, arch = item["name"], current_arch()
+    url = item[f"url_{arch}"]
+    basename = url.rsplit("/", 1)[-1].split("?", 1)[0] or "download.bin"
+    archive = staging / basename
+    log(f"安装 {name}：从 {url} 下载 {arch} 构建")
+    download(url, archive)
+    verify_digest(name, archive, "sha256", item[f"sha256_{arch}"])
+    if item.get("format", "binary") == "tgz":
+        try:
+            with tarfile.open(archive, "r:*") as tar:
+                tar.extractall(staging, filter="data")
+        except tarfile.TarError as error:
+            raise RuntimeError(f"安装 {name}：下载的文件不是合法 tar 包（{error}）") from error
+        archive.unlink()
+    else:
+        archive.chmod(0o755)
+
+
+# ---------- skill 和提示 ----------
+
+
+def install_skills(config: dict) -> None:
+    section = config.get("skills")
+    if not section:
+        return
+    target = Path(os.path.expanduser(section["target"]))
+    for source in SKILL_SOURCE.rglob("*"):
+        if not source.is_file():
+            continue
+        destination = target / source.relative_to(SKILL_SOURCE)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+    log(f"skill 装到 {target}")
+
+
+def install_prompt(config: dict) -> None:
+    section = config.get("prompt")
+    if not section:
+        return
+    target = Path(os.path.expanduser(section["target"]))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(PROMPT_SOURCE, target)
+    log(f"系统提示装到 {target}")
+
+
+# ---------- 模型网关 ----------
+
+
+def apply_gateway(config: dict) -> None:
+    section = config.get("gateway")
+    if not section:
+        return
+    missing = [key for key in GATEWAY_ENV if not os.environ.get(key, "").strip()]
+    action = "clear" if missing else "apply"
+    hook = section["hook"]
+    if not os.access(hook, os.X_OK):
+        die(f"网关钩子 {hook} 不存在或不可执行：子镜像要 COPY 自己的钩子到这里，或在 [gateway] 里改 hook")
+    log(f"模型网关：调 {hook} {action}" + (f"（缺 {'、'.join(missing)}）" if missing else ""))
+    result = subprocess.run([hook, action], stdin=subprocess.DEVNULL)
+    if result.returncode != 0:
+        raise RuntimeError(f"网关钩子 {hook} {action} 失败（退出码 {result.returncode}），看上面日志")
+
+
+# ---------- ACP 转发 ----------
+
+
+async def relay(client: socket.socket, process: asyncio.subprocess.Process, strip_ansi: bool) -> None:
+    """双向转发，照搬 wonton-plugin-codex 的 relay：socket↔子进程 stdio，逐行去配色码。"""
+    loop = asyncio.get_running_loop()
+
+    async def socket_to_agent() -> None:
+        while data := await loop.sock_recv(client, 512 * 1024):
+            if process.stdin is None:
+                return
+            process.stdin.write(data)
+            await process.stdin.drain()
+
+    async def agent_to_socket() -> None:
+        while line := await process.stdout.readline():
+            if strip_ansi:
+                line = ANSI.sub("", line.decode(errors="replace")).encode()
+            await loop.sock_sendall(client, line)
+
+    tasks = [asyncio.create_task(socket_to_agent()), asyncio.create_task(agent_to_socket())]
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    for task in pending:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    for task in done:
+        task.result()
+
+
+async def run_connection(client: socket.socket, process: asyncio.subprocess.Process,
+                         strip_ansi: bool) -> None:
+    try:
+        await relay(client, process, strip_ansi)
+    except (OSError, ValueError):
+        pass  # 对端断开时的竞态（BrokenPipe 等），子进程在下面统一收掉
+    finally:
+        try:
+            client.close()
+        finally:
+            if process.returncode is None:
+                process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), 5)
+                except asyncio.TimeoutError:
+                    process.kill()
+                    await process.wait()
+
+
+async def serve(config: dict) -> None:
+    command = config["acp"]["command"]
+    strip_ansi = config["acp"].get("strip_ansi", True)
+    # 起不来是子镜像配置坏了：在监听之前就报错，健康检查不过，别等第一个连接才暴露。
+    if not shutil.which(command[0]):
+        raise RuntimeError(
+            f"ACP 命令 {command[0]} 不存在或不可执行：检查 [acp] command，或 [install] 是否装到位")
+    for directory in (AGENT_HOME, WORKSPACE, SOCKET.parent):
+        directory.mkdir(parents=True, exist_ok=True)
+    try:
+        SOCKET.unlink()
+    except FileNotFoundError:
+        pass
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(SOCKET))
+    # 只有桥和宿主诊断连：不给组和其他人。
+    os.chmod(SOCKET, 0o600)
+    listener.listen(8)
+    listener.setblocking(False)
+    log(f"ACP 转发就绪：{SOCKET} -> {command[0]}")
+    loop = asyncio.get_running_loop()
+    try:
+        while True:
+            client, _ = await loop.sock_accept(listener)
+            client.setblocking(False)
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *command,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    # stderr=None：子进程 stderr 继承容器的，直接进容器日志。
+                    stderr=None,
+                    cwd=WORKSPACE,
+                    # ACP 一行就是一条消息，带上下文块时远超默认的 64KiB。
+                    limit=2 ** 24,
+                )
+            except OSError as error:
+                client.close()
+                # 命令起不来是子镜像配置坏了，重试连接不会好：退出让核心看到失败。
+                raise RuntimeError(f"启动 ACP 命令 {command} 失败：{error}") from error
+            asyncio.create_task(run_connection(client, process, strip_ansi))
+    finally:
+        listener.close()
+        try:
+            SOCKET.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def main() -> None:
+    config = load_config()
+    try:
+        install_tools(config)
+        install_skills(config)
+        install_prompt(config)
+        apply_gateway(config)
+        asyncio.run(serve(config))
+    except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+        die(str(error))
+
+
+if __name__ == "__main__":
+    main()

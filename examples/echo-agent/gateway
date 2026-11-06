@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+"""echo-agent 的网关钩子：apply 把网关地址和模型名写进 ~/.echo-agent/gateway.json（0600），
+clear 删掉。密钥不落盘：文件里只写变量名，echo-agent 用的时候读环境变量。"""
+import json
+import os
+import sys
+from pathlib import Path
+
+path = Path(os.path.expanduser("~/.echo-agent/gateway.json"))
+if sys.argv[1] == "apply":
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "base_url": os.environ["WONTON_MODEL_BASE_URL"],
+        "model": os.environ["WONTON_MODEL_DEFAULT"],
+        "api_key_env": "WONTON_MODEL_API_KEY",
+    }))
+    path.chmod(0o600)
+elif sys.argv[1] == "clear":
+    path.unlink(missing_ok=True)
+else:
+    print(f"用法：{sys.argv[0]} apply|clear", file=sys.stderr)
+    sys.exit(2)

@@ -1,0 +1,9 @@
+# echo-agent 的配置：子镜像的全部差异就是这份文件和 Dockerfile COPY 进来的东西。
+[acp]
+command = ["python3", "/usr/local/bin/echo-agent"]
+
+[skills]
+target = "~/.agents/skills"
+
+[gateway]
+hook = "/usr/local/lib/wonton-agent/gateway"

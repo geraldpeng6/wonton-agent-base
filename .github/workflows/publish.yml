@@ -1,0 +1,46 @@
+# 在 GitHub 托管的机器上构建并推送多架构镜像到 ghcr.io，不要本机登录镜像仓库。
+# 手动触发（Actions → 发布 → Run workflow）：先跑 tests/（Python unittest，只用标准库），
+# 全绿才构建。版本号取仓库根的 VERSION 文件，推 ghcr.io/geraldpeng6/wonton-agent-base:<版本>。
+name: 发布
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: 测试
+        run: python3 -m unittest discover -s tests -v
+
+  publish:
+    needs: test
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: 构建并推送
+        run: |
+          VERSION="$(cat VERSION)"
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --tag "ghcr.io/geraldpeng6/wonton-agent-base:${VERSION}" \
+            --push .
+          echo "已推送 ghcr.io/geraldpeng6/wonton-agent-base:${VERSION}"

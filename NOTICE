@@ -1,0 +1,10 @@
+wonton-agent-base
+Copyright 2026 Wonton plugin authors
+
+本仓库的代码以 Apache-2.0 许可发布（见 LICENSE）。
+
+发布的镜像基于 Debian（public.ecr.aws/docker/library/debian:trixie-slim，按摘要固定），
+各软件包的许可见镜像内 /usr/share/doc/；并包含 Node.js 官方二进制
+（MIT License，Copyright Node.js contributors，https://github.com/nodejs/node），
+版本和摘要固定在 Dockerfile 里。闭源 CLI 不打进镜像，由入口在容器首次启动时按
+agent.toml 从官方源下载到数据卷，其许可证由各 Agent 插件的子镜像自己声明。
