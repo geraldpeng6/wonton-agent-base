@@ -12,6 +12,8 @@
 4. [acp]：在 $WONTON_ACP_SOCKET 上监听，每个连接起一次 ACP 命令（stdio 说 ACP）双向转发，
    连接断了杀掉子进程。转发时去掉终端配色码；子进程 stderr 直接进容器日志。
    socket 在前面几步都成功之后才建，compose 的健康检查以 socket 文件为准，建好之前不过。
+   收到 SIGTERM/SIGINT 优雅退出：给活着的 ACP 子进程 terminate（5 秒后 kill）、删 socket、
+   退出码 0，docker stop 不用等满 10 秒的 SIGKILL。
 
 codex 插件特有的 rewrite_auth_methods（initialize 应答改写登录方式）和 serve_login（终端登录
 socket）依赖 codex 的登录命令和桥的登录协议，留在 wonton-plugin-codex 自己的入口里，见 README。
@@ -23,6 +25,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -31,7 +34,7 @@ import tomllib
 import urllib.request
 from pathlib import Path
 
-CONFIG_PATH = Path("/etc/wonton-agent/agent.toml")
+CONFIG_PATH = Path(os.environ.get("WONTON_AGENT_CONFIG", "/etc/wonton-agent/agent.toml"))
 SKILL_SOURCE = Path("/usr/local/share/wonton-agent/skills")
 PROMPT_SOURCE = Path("/usr/local/share/wonton-agent/prompt.md")
 TOOLS_ROOT = Path("/data/agent/tools")
@@ -307,23 +310,30 @@ async def relay(client: socket.socket, process: asyncio.subprocess.Process, stri
         task.result()
 
 
+async def stop_process(process: asyncio.subprocess.Process) -> None:
+    """先 SIGTERM 给子进程自己收尾的机会，5 秒不退再 SIGKILL；已经退出就不动。"""
+    if process.returncode is not None:
+        return
+    process.terminate()
+    try:
+        await asyncio.wait_for(process.wait(), 5)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()
+
+
 async def run_connection(client: socket.socket, process: asyncio.subprocess.Process,
-                         strip_ansi: bool) -> None:
+                         strip_ansi: bool, children: set) -> None:
     try:
         await relay(client, process, strip_ansi)
     except (OSError, ValueError):
         pass  # 对端断开时的竞态（BrokenPipe 等），子进程在下面统一收掉
     finally:
+        children.discard(process)
         try:
             client.close()
         finally:
-            if process.returncode is None:
-                process.terminate()
-                try:
-                    await asyncio.wait_for(process.wait(), 5)
-                except asyncio.TimeoutError:
-                    process.kill()
-                    await process.wait()
+            await stop_process(process)
 
 
 async def serve(config: dict) -> None:
@@ -347,6 +357,7 @@ async def serve(config: dict) -> None:
     listener.setblocking(False)
     log(f"ACP 转发就绪：{SOCKET} -> {command[0]}")
     loop = asyncio.get_running_loop()
+    children: set[asyncio.subprocess.Process] = set()
     try:
         while True:
             client, _ = await loop.sock_accept(listener)
@@ -366,16 +377,29 @@ async def serve(config: dict) -> None:
                 client.close()
                 # 命令起不来是子镜像配置坏了，重试连接不会好：退出让核心看到失败。
                 raise RuntimeError(f"启动 ACP 命令 {command} 失败：{error}") from error
-            asyncio.create_task(run_connection(client, process, strip_ansi))
+            children.add(process)
+            asyncio.create_task(run_connection(client, process, strip_ansi, children))
     finally:
         listener.close()
         try:
             SOCKET.unlink()
         except FileNotFoundError:
             pass
+        # 正常不走到这（收到 SIGTERM 被取消时才走）：把还活着的子进程收干净再退。
+        await asyncio.gather(*(stop_process(process) for process in children))
+
+
+def shutdown(signum: int, frame: object) -> None:
+    # 容器里入口是 PID 1，内核忽略默认处置：不装处理，docker stop 要等满 10 秒才 SIGKILL，
+    # ACP 子进程也被硬杀。抛 SystemExit 让 serve 的 finally 收尾（子进程、socket），
+    # asyncio 的清理跑完后退出码 0。
+    log(f"收到 {signal.Signals(signum).name}，退出")
+    raise SystemExit(0)
 
 
 def main() -> None:
+    for received in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(received, shutdown)
     config = load_config()
     try:
         install_tools(config)

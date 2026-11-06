@@ -63,7 +63,9 @@ strip_ansi = true                  # 缺省 true
 ```
 
 npm 来源解包后会在目录里跑 `npm install --prefix <目录> --ignore-scripts` 装依赖：
-不执行包里的安装脚本，闭源 CLI 的安装代码不碰容器其余部分。
+不执行包里的安装脚本，闭源 CLI 的安装代码不碰容器其余部分。integrity 只核对顶层包，
+依赖按包里的 npm-shrinkwrap.json 锁定（没有就按 semver 取当时的版本），挑 CLI 时优先选
+自带 shrinkwrap 或单文件发布的。
 `[install]` 的 name 只允许字母数字点下划线连字符；配置有拼错的段、缺字段、摘要不合法，
 入口启动即报错退出，写清是哪一项。
 
