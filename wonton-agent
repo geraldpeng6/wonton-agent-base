@@ -18,6 +18,10 @@
    并在 ACP socket 旁边监听 <ACP socket 去掉扩展名>.login.sock：桥连上来发一行
    {"methodId","args","env"}，入口按 agent.toml 里配的命令起登录进程，双向搬运
    stdin/stdout/stderr（每行去配色码），登录成功后入口自己退出，容器按 restart 策略重启。
+6. [web]（可选）：在 0.0.0.0:<port> 起登录网页（插件清单声明成 webui，核心网关挡在前面，
+   从 App 的插件页打开）。页面列出 [[login]] 和状态（[[login]] 的 status 命令，退出码 0 =
+   已登录），点登录起同一段命令：输出逐行显示、回一行进 stdin、可取消。和登录 socket 共用
+   一把串行锁，一次一个；输入内容不记日志。
 """
 import asyncio
 import base64
@@ -25,6 +29,7 @@ import hashlib
 import json
 import os
 import platform
+import queue
 import re
 import shutil
 import signal
@@ -32,9 +37,12 @@ import socket
 import subprocess
 import sys
 import tarfile
+import threading
 import tomllib
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
 
 CONFIG_PATH = Path(os.environ.get("WONTON_AGENT_CONFIG", "/etc/wonton-agent/agent.toml"))
 SKILL_SOURCE = Path("/usr/local/share/wonton-agent/skills")
@@ -51,6 +59,16 @@ AGENT_HOME = Path(os.environ.get("HOME", "/data/agent/home"))
 # terminate 再等这么久，最后 kill。测试里调短，不必等满 2 秒。
 RESTART_DELAY = 2
 DISCONNECT_GRACE = 2
+
+# 登录网页：状态命令最多等这么久（每个并发查，超时算查询出错）；静态文件在镜像里的位置。
+STATUS_TIMEOUT = 10
+WEB_ROOT = Path("/usr/local/share/wonton-agent/web")
+# 网页要用的 [[login]] 段、事件循环和 HTTP 服务器，start_web_server 里赋值；测试读
+# WEB_SERVER 拿实际端口。
+WEB_LOGINS: list[dict] = []
+WEB_LOOP: asyncio.AbstractEventLoop | None = None
+WEB_SERVER: ThreadingHTTPServer | None = None
+LOGIN_API_RE = re.compile(r"^/api/logins/([A-Za-z0-9][A-Za-z0-9._-]*)/(start|events|input|cancel)$")
 
 # 桥把终端登录的链接和提示原样发进聊天：去掉终端配色码（照搬 wonton-plugin-codex）。
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -78,12 +96,15 @@ def load_config(path: Path = CONFIG_PATH) -> dict:
         die(f"找不到配置 {path}：子镜像要 COPY agent.toml /etc/wonton-agent/")
     except tomllib.TOMLDecodeError as error:
         die(f"配置 {path} 不是合法 TOML：{error}")
-    unknown = set(config) - {"install", "skills", "prompt", "gateway", "acp", "login"}
+    unknown = set(config) - {"install", "skills", "prompt", "gateway", "acp", "login", "web"}
     if unknown:
         die(f"配置 {path} 有不认识的段 {'、'.join(sorted(unknown))}，检查字段名有没有拼错")
+    if "web" in config and not config.get("login"):
+        die("配置 [web] 列不出登录方式：网页列的就是 [[login]]，没有 [[login]] 就删掉 [web]")
     validate_acp(config.get("acp"))
     validate_installs(config.get("install", []))
     validate_logins(config.get("login", []))
+    validate_web(config.get("web"))
     for section in ("skills", "prompt"):
         if section in config and not isinstance(config[section].get("target"), str):
             die(f"配置 [{section}] 缺 target（字符串路径）")
@@ -155,6 +176,22 @@ def validate_logins(items: list) -> None:
                 "或 line_then_eof（转第一行后关 stdin，给读 stdin 到 EOF 收 key 的 CLI）")
         if not isinstance(item.get("restart_on_success", True), bool):
             die(f"[[login]] {login_id} 的 restart_on_success 必须是布尔值（缺省 true：登录成功后重启容器）")
+        status = item.get("status")
+        if status is not None and (
+                not isinstance(status, list) or not status
+                or not all(isinstance(arg, str) and arg for arg in status)):
+            die(f'[[login]] {login_id} status 必须是非空字符串列表，'
+                '例如 status = ["codex", "login", "status"]（退出码 0 = 已登录）')
+
+
+def validate_web(section: dict | None) -> None:
+    if section is None:
+        return
+    if not isinstance(section, dict):
+        die("[web] 必须是表：port = 8080")
+    port = section.get("port")
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        die("[web] 缺 port 或不是 1–65535 的整数，例如 port = 8080")
 
 
 def login_methods(config: dict) -> list[dict] | None:
@@ -425,13 +462,20 @@ async def serve(config: dict) -> None:
             raise RuntimeError(
                 f"[[login]] {section['id']} 的命令 {section['command'][0]} 不存在或不可执行："
                 "检查 [[login]] command，或 [install] 是否装到位")
+        if section.get("status") and not shutil.which(section["status"][0]):
+            raise RuntimeError(
+                f"[[login]] {section['id']} 的状态命令 {section['status'][0]} 不存在或不可执行："
+                "检查 [[login]] status，或 [install] 是否装到位")
     for directory in (AGENT_HOME, WORKSPACE, SOCKET.parent):
         directory.mkdir(parents=True, exist_ok=True)
     loop = asyncio.get_running_loop()
     children: set[asyncio.subprocess.Process] = set()
     # 登录 socket 在 ACP socket 之前建好（健康检查看的是 ACP socket）；没有 [[login]] 就不建。
+    # 串行锁和会话表登录 socket 与网页共用，serve 每次运行新建（asyncio 原语绑事件循环）。
+    global LOGIN_LOCK
+    LOGIN_LOCK = asyncio.Lock()
     login_socket = SOCKET.with_suffix(".login.sock") if methods else None
-    listener = login_listener = login_task = None
+    listener = login_listener = login_task = web_server = None
     try:
         if login_socket:
             login_listener = listen_unix(login_socket, 2)
@@ -440,6 +484,8 @@ async def serve(config: dict) -> None:
         if login_listener:
             login_task = asyncio.create_task(serve_login(login_listener, config["login"]))
             log(f"终端登录就绪：{login_socket}（{'、'.join(s['id'] for s in config['login'])}）")
+        if config.get("web"):
+            web_server = start_web_server(config["login"], config["web"]["port"])
         while True:
             client, _ = await loop.sock_accept(listener)
             client.setblocking(False)
@@ -464,6 +510,9 @@ async def serve(config: dict) -> None:
         if login_task:
             login_task.cancel()
             await asyncio.gather(login_task, return_exceptions=True)
+        if web_server:
+            web_server.shutdown()
+            web_server.server_close()
         for sock in (listener, login_listener):
             if sock:
                 sock.close()
@@ -482,6 +531,121 @@ async def serve(config: dict) -> None:
 
 async def send_frame(client: socket.socket, loop: asyncio.AbstractEventLoop, frame: dict) -> None:
     await loop.sock_sendall(client, (json.dumps(frame, ensure_ascii=False) + "\n").encode())
+
+
+# 登录一次一个，登录 socket（桥）和网页共用；serve() 每次运行新建（asyncio 原语绑事件循环）。
+# 谁在跑记在 ACTIVE_LOGINS（只在该循环线程里改），网页的列表、SSE 和取消都从这里找会话；
+# 跑完的按 id 留在 FINISHED_LOGINS，页面在 start 之后才开 SSE 也收得到输出和退出码。
+LOGIN_LOCK: asyncio.Lock | None = None
+ACTIVE_LOGINS: dict[str, "LoginSession"] = {}
+FINISHED_LOGINS: dict[str, "LoginSession"] = {}
+
+
+def retire_session(session: "LoginSession") -> None:
+    login_id = session.section["id"]
+    ACTIVE_LOGINS.pop(login_id, None)
+    FINISHED_LOGINS[login_id] = session
+
+
+class LoginSession:
+    """一次登录进程：起进程、stdout/stderr 每行去配色码放进 frames、写 stdin、收尾。
+    frames 依次是 {"out": 行}/{"err": 行}，收完进 {"exit": 数字}；每条入口一个消费方，
+    桥这边是 forward_frames，网页那边是 pump_frames。"""
+
+    def __init__(self, section: dict, env: dict | None = None):
+        self.section = section
+        self.env = env or {}
+        self.stdin_mode = section.get("stdin", "lines")
+        self.process: asyncio.subprocess.Process | None = None
+        self.frames: asyncio.Queue[dict] = asyncio.Queue()
+        self.exited = asyncio.Event()
+        self.exit_code: int | None = None
+
+    def stdin_open(self) -> bool:
+        return (self.process is not None and self.process.stdin is not None
+                and not self.process.stdin.is_closing())
+
+    async def start(self) -> None:
+        try:
+            self.process = await asyncio.create_subprocess_exec(
+                *self.section["command"],
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env={**os.environ, **self.env},
+                cwd=WORKSPACE,
+            )
+        except OSError as error:
+            self.frames.put_nowait({"err": f"启动登录命令 {self.section['command']} 失败：{error}"})
+            self.exit_code = 1
+            self.frames.put_nowait({"exit": 1})
+            self.exited.set()
+            return
+        asyncio.create_task(self._run())
+
+    async def write_input(self, text: str) -> None:
+        """写一行进 stdin。line_then_eof：写完关掉 stdin（读 stdin 到 EOF 才收 key 的 CLI）。"""
+        stdin = self.process.stdin
+        stdin.write((text + "\n").encode())
+        await stdin.drain()
+        if self.stdin_mode == "line_then_eof":
+            stdin.close()
+
+    async def close_input(self) -> None:
+        """输入端没了（桥断开、网页取消）：stdin 关掉等 2 秒，terminate 等 2 秒，还不退就
+        kill。退出码由 _run 收进 frames。"""
+        process = self.process
+        if process is None:
+            return
+        if process.stdin is not None and not process.stdin.is_closing():
+            process.stdin.close()
+        try:
+            await asyncio.wait_for(process.wait(), DISCONNECT_GRACE)
+            return
+        except asyncio.TimeoutError:
+            pass
+        process.terminate()
+        try:
+            await asyncio.wait_for(process.wait(), DISCONNECT_GRACE)
+            return
+        except asyncio.TimeoutError:
+            pass
+        process.kill()
+        await process.wait()
+
+    async def _run(self) -> None:
+        """收输出、等退出；退出码交给 frames 和 exited，成功且 restart_on_success 就退出
+        整个入口：容器按 restart 策略重启，钩子按新登录态重新选路。"""
+        stdout_task = asyncio.create_task(self._pump(self.process.stdout, "out"))
+        stderr_task = asyncio.create_task(self._pump(self.process.stderr, "err"))
+        code = await self.process.wait()
+        if self.process.stdin is not None and not self.process.stdin.is_closing():
+            self.process.stdin.close()
+        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+        self.exit_code = code
+        self.frames.put_nowait({"exit": code})
+        self.exited.set()
+        if code == 0 and self.section.get("restart_on_success", True):
+            # 等消费方把退出帧收完（桥收到帧、网页画出来），然后退出。
+            await asyncio.sleep(RESTART_DELAY)
+            os._exit(0)
+
+    async def _pump(self, stream: asyncio.StreamReader, key: str) -> None:
+        while line := await stream.readline():
+            self.frames.put_nowait({key: ANSI.sub("", line.decode(errors="replace")).rstrip("\n")})
+
+
+async def forward_frames(session: LoginSession, client: socket.socket,
+                         loop: asyncio.AbstractEventLoop) -> None:
+    """桥这边的帧消费方：逐帧发给桥，发完退出帧就完。桥断开时停发，会话照常跑完。"""
+    while True:
+        frame = await session.frames.get()
+        try:
+            await send_frame(client, loop, frame)
+        except OSError:
+            return
+        if "exit" in frame:
+            return
 
 
 async def serve_login(listener: socket.socket, logins: list[dict]) -> None:
@@ -524,84 +688,304 @@ async def relay_login(client: socket.socket, loop: asyncio.AbstractEventLoop,
         await send_frame(client, loop, {"err": f"没有这种登录方式：{request.get('methodId')}"})
         await send_frame(client, loop, {"exit": 2})
         return
+    # 占住串行锁直到退出帧发出：这期间网页 start 会被拒，后来的桥连接在 backlog 里等。
+    async with LOGIN_LOCK:
+        session = LoginSession(section, request.get("env", {}))
+        ACTIVE_LOGINS[section["id"]] = session
+        try:
+            forward = asyncio.create_task(forward_frames(session, client, loop))
+            await session.start()
+            if session.stdin_mode == "line_then_eof":
+                line = await reader.readline()
+                if line:
+                    await session.write_input(line.decode(errors="replace").rstrip("\n"))
+                else:
+                    # 桥没发内容就断开（取消、超时）：结束登录进程，收回这次串行的登录。
+                    await session.close_input()
+            else:
+                input_task = asyncio.create_task(pump_bridge_input(reader, session))
+                exited_task = asyncio.create_task(session.exited.wait())
+                done, _ = await asyncio.wait({input_task, exited_task},
+                                             return_when=asyncio.FIRST_COMPLETED)
+                if input_task in done:
+                    # 桥断开（取消、超时、桥退出）：登录进程可能还在等 stdin，必须收掉，
+                    # 否则串行的 serve_login 会一直卡在这次登录上。
+                    await session.close_input()
+                else:
+                    input_task.cancel()
+                await asyncio.gather(input_task, exited_task, return_exceptions=True)
+            await forward
+        finally:
+            retire_session(session)
+
+
+async def pump_bridge_input(reader: asyncio.StreamReader, session: LoginSession) -> None:
+    while line := await reader.readline():
+        await session.write_input(line.decode(errors="replace").rstrip("\n"))
+
+
+# ---------- 登录网页 ----------
+
+
+async def start_web_login(section: dict) -> str | None:
+    """网页点登录：锁被占（任何入口的登录在跑）就拒绝，否则占住锁、起好进程再返回。
+    返回 None 表示已启动，"busy" 表示有一个登录正在进行。起进程放在返回前，页面随后
+    的 input/events 一定找得到会话。"""
+    if LOGIN_LOCK.locked():
+        return "busy"
+    await LOGIN_LOCK.acquire()
+    session = LoginSession(section)
+    ACTIVE_LOGINS[section["id"]] = session
+    await session.start()
+    asyncio.create_task(run_web_login(session))
+    return None
+
+
+async def run_web_login(session: LoginSession) -> None:
+    """网页登录的收尾：退出帧进队就留档、放锁，下一位才能登录；成功重启在 _run 里做。"""
+    try:
+        await session.exited.wait()
+    finally:
+        retire_session(session)
+        if LOGIN_LOCK.locked():
+            LOGIN_LOCK.release()
+
+
+async def login_status(section: dict) -> dict:
+    """一段 [[login]] 的状态：status 命令退出码 0 = 已登录，非 0 = 没登录，没写 = 不确定。
+    起不来、超时算查询出错，原因放进 detail。正在登录的跳过查询，如实显示在登录。"""
+    item = {"id": section["id"], "name": section["name"],
+            "stdin": section.get("stdin", "lines"),
+            "restart_on_success": section.get("restart_on_success", True),
+            "busy": section["id"] in ACTIVE_LOGINS,
+            "status": "unknown", "detail": None}
+    command = section.get("status")
+    if item["busy"] or not command:
+        return item
     try:
         process = await asyncio.create_subprocess_exec(
-            *section["command"],
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env={**os.environ, **request.get("env", {})},
-            cwd=WORKSPACE,
-        )
+            *command, stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+            cwd=WORKSPACE)
     except OSError as error:
-        await send_frame(client, loop, {"err": f"启动登录命令 {section['command']} 失败：{error}"})
-        await send_frame(client, loop, {"exit": 1})
-        return
-    stdin = process.stdin
-
-    async def pump_output(stream: asyncio.StreamReader, key: str) -> None:
-        while line := await stream.readline():
-            await send_frame(client, loop, {key: ANSI.sub("", line.decode(errors="replace")).rstrip("\n")})
-
-    async def pump_input() -> None:
-        while line := await reader.readline():
-            stdin.write(line)
-            await stdin.drain()
-
-    stdout_task = asyncio.create_task(pump_output(process.stdout, "out"))
-    stderr_task = asyncio.create_task(pump_output(process.stderr, "err"))
-    if section.get("stdin", "lines") == "line_then_eof":
-        # 读 stdin 到 EOF 才收 key 的 CLI：转第一行后关掉登录进程的 stdin 制造 EOF，
-        # 桥那边照旧保持连接收输出帧（照搬 codex 入口）。
-        line = await reader.readline()
-        if not line:
-            # 桥没发内容就断开（取消、超时）：结束登录进程，收回这次串行的登录。
-            code = await end_login_process(process)
-        else:
-            stdin.write(line)
-            await stdin.drain()
-            stdin.close()
-            code = await process.wait()
-        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
-    else:
-        input_task = asyncio.create_task(pump_input())
-        exit_task = asyncio.create_task(process.wait())
-        done, _ = await asyncio.wait({exit_task, input_task}, return_when=asyncio.FIRST_COMPLETED)
-        if input_task in done:
-            # 桥断开（取消、超时、桥退出）：登录进程可能还在等 stdin，必须结束并收回，
-            # 否则串行的 serve_login 会一直卡在这次登录上。
-            code = await end_login_process(process)
-        else:
-            code = exit_task.result()
-        input_task.cancel()
-        await asyncio.gather(stdout_task, stderr_task, exit_task, input_task, return_exceptions=True)
-    # 输出泵收完才发退出帧：桥收到 exit 就停读，"Successfully logged in" 和失败原因
-    # 不能跟退出帧竞态。
+        item["status"] = "error"
+        item["detail"] = f"起状态命令失败：{error}"
+        return item
     try:
-        await send_frame(client, loop, {"exit": code})
-    except OSError:
-        return
-    if code == 0 and section.get("restart_on_success", True):
-        # 登录态已写进数据卷。等桥收尾，然后退出整个入口，容器按 restart 策略重启，
-        # 钩子按新登录态重新选路（照搬 codex 入口）。
-        await asyncio.sleep(RESTART_DELAY)
-        os._exit(0)
-
-
-async def end_login_process(process: asyncio.subprocess.Process) -> int:
-    """桥断开：stdin 关掉等 2 秒，terminate 等 2 秒，还不退就 kill。返回退出码。"""
-    if process.stdin is not None:
-        process.stdin.close()
-    try:
-        return await asyncio.wait_for(process.wait(), DISCONNECT_GRACE)
-    except asyncio.TimeoutError:
-        pass
-    process.terminate()
-    try:
-        return await asyncio.wait_for(process.wait(), DISCONNECT_GRACE)
+        _, stderr = await asyncio.wait_for(process.communicate(), STATUS_TIMEOUT)
     except asyncio.TimeoutError:
         process.kill()
-        return await process.wait()
+        await process.wait()
+        item["status"] = "error"
+        item["detail"] = f"状态命令超过 {STATUS_TIMEOUT} 秒没退出"
+        return item
+    item["status"] = "logged_in" if process.returncode == 0 else "logged_out"
+    return item
+
+
+async def query_logins(sections: list[dict]) -> list[dict]:
+    return list(await asyncio.gather(*(login_status(section) for section in sections)))
+
+
+async def pump_frames(session: LoginSession, sink: queue.Queue) -> None:
+    """网页 SSE 这边的帧消费方：逐帧搬给 HTTP 线程。会话结束、帧也取干净了就放哨兵收尾
+    （挂到已结束的会话上：把剩下的帧发完就关）。"""
+    while True:
+        try:
+            frame = await asyncio.wait_for(session.frames.get(), 0.5)
+        except asyncio.TimeoutError:
+            if session.exited.is_set() and session.frames.empty():
+                sink.put(None)
+                return
+            continue
+        sink.put(frame)
+        if "exit" in frame:
+            sink.put(None)
+            return
+
+
+class LoginHTTPServer(ThreadingHTTPServer):
+    def server_bind(self) -> None:
+        # 跳过 HTTPServer.server_bind 里的 socket.getfqdn（填 server_name 用的反向 DNS）：
+        # 网页用不上 server_name，宿主机 DNS 慢时它能把起网页卡住几秒。
+        if self.allow_reuse_address:
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.socket.bind(self.server_address)
+        self.server_address = self.socket.getsockname()
+
+
+def start_web_server(logins: list[dict], port: int) -> ThreadingHTTPServer:
+    """在 0.0.0.0:<port> 起登录网页（插件清单声明成 webui，核心网关挡在前面）。HTTP 跑在
+    daemon 线程里，asyncio 的活经 run_coroutine_threadsafe 回当前循环。"""
+    global WEB_LOOP, WEB_LOGINS, WEB_SERVER
+    WEB_LOOP = asyncio.get_running_loop()
+    WEB_LOGINS = logins
+    server = LoginHTTPServer(("0.0.0.0", port), LoginWebHandler)
+    server.daemon_threads = True
+    WEB_SERVER = server
+    threading.Thread(target=server.serve_forever, name="wonton-agent-web", daemon=True).start()
+    log(f"登录网页就绪：0.0.0.0:{server.server_address[1]}")
+    return server
+
+
+class LoginWebHandler(BaseHTTPRequestHandler):
+    """登录网页：静态页（WEB_ROOT 下的 index.html 和 tokens.css）+ /api/logins 接口。
+    POST 只收 JSON（挡跨站表单）；输入内容不进日志。"""
+
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self) -> None:
+        path = urlsplit(self.path).path
+        if path in ("", "/"):
+            self.send_file(WEB_ROOT / "index.html", "text/html; charset=utf-8")
+        elif path == "/tokens.css":
+            self.send_file(WEB_ROOT / "tokens.css", "text/css; charset=utf-8")
+        elif path == "/api/logins":
+            self.send_json(200, self.list_logins())
+        elif match := LOGIN_API_RE.match(path):
+            if match.group(2) == "events":
+                self.events(match.group(1))
+            else:
+                self.send_json(405, {"error": "method_not_allowed"})
+        else:
+            self.send_json(404, {"error": "not_found"})
+
+    def do_POST(self) -> None:
+        match = LOGIN_API_RE.match(urlsplit(self.path).path)
+        if not match or match.group(2) == "events":
+            self.send_json(404, {"error": "not_found"})
+            return
+        login_id, action = match.groups()
+        section = next((s for s in WEB_LOGINS if s["id"] == login_id), None)
+        if section is None:
+            self.send_json(404, {"error": "not_found"})
+            return
+        if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+            self.send_json(415, {"error": "bad_content_type"})
+            return
+        body = self.read_json_body()
+        if body is None:
+            return
+        if action == "start":
+            self.start(section)
+        elif action == "input":
+            self.input(login_id, body)
+        else:
+            self.cancel(login_id)
+
+    def list_logins(self) -> dict:
+        future = asyncio.run_coroutine_threadsafe(query_logins(WEB_LOGINS), WEB_LOOP)
+        logins = future.result(STATUS_TIMEOUT + 10)
+        return {"logins": logins, "busy": any(item["busy"] for item in logins)}
+
+    def start(self, section: dict) -> None:
+        future = asyncio.run_coroutine_threadsafe(start_web_login(section), WEB_LOOP)
+        if future.result(10) == "busy":
+            self.send_json(409, {"error": "busy"})
+        else:
+            self.send_json(200, {"ok": True})
+
+    def input(self, login_id: str, body: dict) -> None:
+        text = body.get("text")
+        if not isinstance(text, str):
+            self.send_json(400, {"error": "bad_request"})
+            return
+        session = ACTIVE_LOGINS.get(login_id)
+        if session is None:
+            self.send_json(409, {"error": "not_running"})
+            return
+        if not session.stdin_open():
+            self.send_json(409, {"error": "stdin_closed"})
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(session.write_input(text), WEB_LOOP).result(10)
+        except Exception:
+            # 进程刚好退了，输入没送进去：按输入已关处理，不把内容写进任何日志。
+            self.send_json(409, {"error": "stdin_closed"})
+            return
+        self.send_json(200, {"ok": True})
+
+    def cancel(self, login_id: str) -> None:
+        session = ACTIVE_LOGINS.get(login_id)
+        if session is None:
+            self.send_json(409, {"error": "not_running"})
+            return
+        # stdin 关掉等 2 秒、terminate 等 2 秒、kill：宽限上限之内回话。
+        asyncio.run_coroutine_threadsafe(session.close_input(), WEB_LOOP).result(
+            DISCONNECT_GRACE * 2 + 10)
+        self.send_json(200, {"ok": True})
+
+    def events(self, login_id: str) -> None:
+        session = ACTIVE_LOGINS.get(login_id) or FINISHED_LOGINS.get(login_id)
+        if session is None:
+            self.send_json(409, {"error": "not_running"})
+            return
+        sink: queue.Queue = queue.Queue()
+        asyncio.run_coroutine_threadsafe(pump_frames(session, sink), WEB_LOOP)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        try:
+            while True:
+                try:
+                    frame = sink.get(timeout=15)
+                except queue.Empty:
+                    # 没输出时也发个注释行，别让中间的代理把空闲连接掐了。
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+                    continue
+                if frame is None:
+                    break
+                self.wfile.write(f"data: {json.dumps(frame, ensure_ascii=False)}\n\n".encode())
+                self.wfile.flush()
+                if "exit" in frame:
+                    break
+        except OSError:
+            pass  # 页面关了：SSE 断开，登录进程照常跑完（成功照样重启）。
+
+    def read_json_body(self) -> dict | None:
+        raw_length = self.headers.get("Content-Length")
+        if not raw_length or not raw_length.isdigit() or int(raw_length) > 64 * 1024:
+            self.send_json(400, {"error": "bad_request"})
+            return None
+        try:
+            body = json.loads(self.rfile.read(int(raw_length)))
+        except ValueError:
+            self.send_json(400, {"error": "bad_json"})
+            return None
+        if not isinstance(body, dict):
+            self.send_json(400, {"error": "bad_json"})
+            return None
+        return body
+
+    def send_json(self, code: int, body: dict) -> None:
+        data = json.dumps(body, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def send_file(self, path: Path, content_type: str) -> None:
+        try:
+            data = path.read_bytes()
+        except OSError:
+            self.send_json(404, {"error": "not_found"})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, format: str, *args) -> None:
+        # 访问日志只有方法和路径；请求体（可能藏着回码）不打。
+        log(f"网页 {format % args}")
 
 
 def shutdown(signum: int, frame: object) -> None:

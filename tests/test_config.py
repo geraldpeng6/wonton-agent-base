@@ -190,6 +190,36 @@ class LoadConfigTests(unittest.TestCase):
                           'restart_on_success = "yes"\n')
         self.assertIn("restart_on_success", message)
 
+    def test_login_status_validates(self):
+        _, message = load('[acp]\ncommand = ["x"]\n\n[[login]]\nid = "a"\nname = "A"\ncommand = ["/a"]\n'
+                          'status = []\n')
+        self.assertIn("status", message)
+        _, message = load('[acp]\ncommand = ["x"]\n\n[[login]]\nid = "a"\nname = "A"\ncommand = ["/a"]\n'
+                          'status = ["a", 3]\n')
+        self.assertIn("status", message)
+        config, message = load('[acp]\ncommand = ["x"]\n\n[[login]]\nid = "a"\nname = "A"\n'
+                               'command = ["/a"]\nstatus = ["codex", "login", "status"]\n')
+        self.assertIsNone(message)
+        self.assertEqual(config["login"][0]["status"], ["codex", "login", "status"])
+
+    def test_web_section_validates(self):
+        login = '[[login]]\nid = "a"\nname = "A"\ncommand = ["/a"]\n'
+        # 没有 [[login]] 而写了 [web]：启动即报错。
+        _, message = load("[web]\nport = 8080\n")
+        self.assertIn("[[login]]", message)
+        # 缺 port、端口出界、类型不对都报错。
+        _, message = load(f'[acp]\ncommand = ["x"]\n\n[web]\n{login}')
+        self.assertIn("port", message)
+        _, message = load(f'[acp]\ncommand = ["x"]\n\n[web]\nport = 0\n{login}')
+        self.assertIn("port", message)
+        _, message = load(f'[acp]\ncommand = ["x"]\n\n[web]\nport = 70000\n{login}')
+        self.assertIn("port", message)
+        _, message = load(f'[acp]\ncommand = ["x"]\n\n[web]\nport = "8080"\n{login}')
+        self.assertIn("port", message)
+        config, message = load(f'[acp]\ncommand = ["x"]\n\n[web]\nport = 8080\n{login}')
+        self.assertIsNone(message)
+        self.assertEqual(config["web"]["port"], 8080)
+
     def test_invalid_toml_rejected(self):
         stderr = StringIO()
         with redirect_stderr(stderr):

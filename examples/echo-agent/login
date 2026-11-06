@@ -1,5 +1,6 @@
 #!/bin/sh
-# 最小登录样例（[[login]] 的 command 指到这里）：读一行当 key，打印成功后退出 0。
-# stdin 模式是缺省的 lines：桥把聊天里发来的内容一行行转过来。
+# 最小登录样例（[[login]] 的 command 指到这里）：读一行当 key，写标记文件后打印成功退出 0。
+# stdin 模式是缺省的 lines：网页和聊天把内容一行行转过来。
 read -r key || exit 1
+: > "$HOME/sample-logged-in"
 echo "logged in"

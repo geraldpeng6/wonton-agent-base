@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>登录</title>
+  <!-- 云吞页面令牌：在 App 里跟着明暗和重点色，单独打开用 tokens.css 里的后备值。 -->
+  <link rel="stylesheet" href="/tokens.css">
+  <style>
+    body {
+      margin: 0;
+      background: var(--color-background-primary, Canvas);
+      color: var(--color-text-primary, CanvasText);
+      font-family: var(--font-sans, system-ui, sans-serif);
+      padding-top: var(--wonton-inset-top, 0);
+      padding-bottom: var(--wonton-inset-bottom, 0);
+    }
+    main { max-width: 520px; margin: 0 auto; padding: 16px 16px 32px; }
+    .row { padding: 14px 0; border-bottom: 1px solid var(--color-border-primary, color-mix(in srgb, CanvasText 18%, Canvas)); }
+    .row:last-child { border-bottom: none; }
+    .head { display: flex; align-items: center; gap: 10px; }
+    .name { flex: 1; font-size: 16px; font-weight: 500; overflow-wrap: anywhere; }
+    .badge { font-size: 12px; line-height: 1; padding: 5px 9px; border-radius: var(--border-radius-full, 999px); white-space: nowrap; }
+    .badge.logged_in { color: var(--color-text-success, #18753C); background: var(--color-background-success, color-mix(in srgb, var(--color-text-success, #18753C) 12%, Canvas)); }
+    .badge.logged_out, .badge.unknown { color: var(--color-text-secondary, color-mix(in srgb, CanvasText 60%, Canvas)); background: var(--color-background-secondary, color-mix(in srgb, CanvasText 5%, Canvas)); }
+    .badge.error { color: var(--color-text-danger, #B42318); background: var(--color-background-danger, color-mix(in srgb, var(--color-text-danger, #B42318) 12%, Canvas)); }
+    .badge.running { color: var(--wonton-accent-ink, #9B494A); background: var(--wonton-accent-fill, #FEEBEA); }
+    .busy { color: var(--color-text-warning, #8A4B00); font-size: 14px; margin: 0 0 2px; }
+    button {
+      font: inherit; padding: 8px 14px; border-radius: var(--border-radius-md, 14px);
+      color: inherit; background: transparent; border: 1px solid var(--color-border-primary, color-mix(in srgb, CanvasText 18%, Canvas));
+    }
+    button.primary { border: none; background: var(--wonton-accent-fill, #FEEBEA); color: var(--wonton-accent-ink, #9B494A); }
+    button:disabled { opacity: .45; }
+    .output {
+      background: var(--color-background-secondary, color-mix(in srgb, CanvasText 5%, Canvas));
+      border-radius: var(--border-radius-md, 14px); padding: 10px 12px; margin: 10px 0 0;
+      font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      max-height: 260px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere;
+    }
+    .line.err { color: var(--color-text-danger, #B42318); }
+    .line a { color: var(--wonton-accent-ink, #9B494A); }
+    .result { margin-top: 10px; font-size: 14px; }
+    .result.ok { color: var(--color-text-success, #18753C); }
+    .result.fail { color: var(--color-text-danger, #B42318); }
+    .result.warn { color: var(--color-text-warning, #8A4B00); }
+    .inputrow { display: flex; gap: 8px; margin-top: 10px; }
+    .inputrow input {
+      flex: 1; min-width: 0; font: inherit; padding: 8px 12px; color: inherit;
+      border-radius: var(--border-radius-md, 14px); border: 1px solid var(--color-border-primary, color-mix(in srgb, CanvasText 18%, Canvas));
+      background: var(--color-background-primary, Canvas);
+    }
+    .inputrow input:focus-visible, button:focus-visible { outline: 2px solid var(--wonton-accent-ink, #9B494A); outline-offset: 1px; }
+    .cancel { margin-top: 10px; }
+    details { margin-top: 6px; font-size: 13px; color: var(--color-text-secondary, color-mix(in srgb, CanvasText 60%, Canvas)); }
+    details pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+    .pageerror { margin-top: 24px; display: grid; gap: 10px; justify-items: start; }
+  </style>
+</head>
+<body>
+<main id="app"></main>
+<script>
+"use strict";
+
+const zh = (navigator.language || "").toLowerCase().startsWith("zh");
+document.documentElement.lang = zh ? "zh" : "en";
+const t = zh ? {
+  status: { logged_in: "已登录", logged_out: "没登录", unknown: "不确定", error: "查询出错" },
+  login: "登录", relogin: "重新登录", running: "登录中…",
+  busyAll: "有一个登录正在进行", cancel: "取消", send: "发送",
+  show: "显示", hide: "隐藏", placeholder: "粘贴回码或 API key",
+  inputLabel: "要发给登录程序的一行", toggleLabel: "显示或隐藏输入内容",
+  successRestart: "登录成功，Agent 正在重启", success: "登录成功",
+  lost: "连接断了", exitCode: (n) => `退出码 ${n}`,
+  loadError: "拿不到登录列表", retry: "重试", details: "详情", generic: "出错了",
+  apiErrors: { busy: "有一个登录正在进行", not_running: "这个登录没有在进行", stdin_closed: "登录程序不再读输入" },
+} : {
+  status: { logged_in: "Logged in", logged_out: "Not logged in", unknown: "Unknown", error: "Query failed" },
+  login: "Log in", relogin: "Log in again", running: "Logging in…",
+  busyAll: "A login is already running", cancel: "Cancel", send: "Send",
+  show: "Show", hide: "Hide", placeholder: "Paste the code or API key",
+  inputLabel: "A line to send to the login program", toggleLabel: "Show or hide the input",
+  successRestart: "Login succeeded, Agent is restarting", success: "Login succeeded",
+  lost: "Connection lost", exitCode: (n) => `Exit code ${n}`,
+  loadError: "Couldn't load the login list", retry: "Retry", details: "Details", generic: "Something went wrong",
+  apiErrors: { busy: "A login is already running", not_running: "No login is running", stdin_closed: "The login program no longer reads input" },
+};
+
+let data = null;
+let pageError = null;
+const sessions = new Map(); // id -> {lines, rendered, running, exit, lost, stdinOpen, cancelling, es, pre}
+
+function el(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+async function post(url, body) {
+  return fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    cache: "no-store",
+  });
+}
+
+function apiText(error) {
+  return (error && t.apiErrors[error.error]) || t.generic;
+}
+
+function loginItem(id) {
+  return data && data.logins.find((item) => item.id === id);
+}
+
+function anyLoginActive() {
+  return (data && data.busy) || [...sessions.values()].some((s) => s.running);
+}
+
+async function refresh() {
+  try {
+    const res = await fetch("/api/logins", { cache: "no-store" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    data = await res.json();
+    pageError = null;
+  } catch (error) {
+    pageError = String(error);
+  }
+  renderAll();
+}
+
+// ---------- 渲染 ----------
+
+function renderAll() {
+  const app = document.getElementById("app");
+  app.textContent = "";
+  if (pageError !== null) {
+    const box = el("div", "pageerror");
+    box.append(el("div", null, t.loadError));
+    const retry = el("button", "primary", t.retry);
+    retry.onclick = refresh;
+    box.append(retry, el("details", null, el("summary", null, t.details), el("pre", null, pageError)));
+    app.append(box);
+    return;
+  }
+  if (!data) return;
+  if (data.busy) app.append(el("p", "busy", t.busyAll));
+  for (const item of data.logins) app.append(rowEl(item));
+}
+
+function rowEl(item) {
+  const s = sessions.get(item.id);
+  const row = el("section", "row");
+  const head = el("div", "head");
+  head.append(el("span", "name", item.name));
+  if (s && s.running) {
+    head.append(el("span", "badge running", t.running));
+  } else {
+    head.append(el("span", `badge ${item.status}`, t.status[item.status] || item.status));
+    const button = el("button", "primary", item.status === "logged_in" ? t.relogin : t.login);
+    button.disabled = anyLoginActive();
+    button.onclick = () => startLogin(item.id);
+    head.append(button);
+  }
+  row.append(head);
+  if (item.status === "error" && item.detail) {
+    row.append(el("details", null, el("summary", null, t.details), el("pre", null, item.detail)));
+  }
+  if (s && (s.lines.length || s.exit !== null || s.lost || s.running)) {
+    if (s.exit !== null || s.lost) row.append(resultEl(item, s));
+    const pre = el("pre", "output");
+    s.pre = pre;
+    s.rendered = 0;
+    for (const line of s.lines) pre.append(lineEl(line));
+    s.rendered = s.lines.length;
+    pre.scrollTop = pre.scrollHeight;
+    row.append(pre);
+    if (s.running) row.append(inputRowEl(item, s), cancelEl(item, s));
+  }
+  return row;
+}
+
+function resultEl(item, s) {
+  if (s.lost) return el("p", "result warn", t.lost);
+  if (s.exit === 0) {
+    return el("p", "result ok", item.restart_on_success ? t.successRestart : t.success);
+  }
+  return el("p", "result fail", t.exitCode(s.exit));
+}
+
+const URL_RE = /https?:\/\/[^\s<>"'）)\]]+/g;
+
+function lineEl(line) {
+  const div = el("div", `line ${line.kind}`);
+  let last = 0;
+  for (const match of line.text.matchAll(URL_RE)) {
+    if (match.index > last) div.append(line.text.slice(last, match.index));
+    let href = match[0];
+    while (/[.,;:)。、；]$/.test(href)) href = href.slice(0, -1);
+    const a = el("a", null, href);
+    a.href = href;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    div.append(a);
+    last = match.index + href.length;
+  }
+  if (last < line.text.length) div.append(line.text.slice(last));
+  return div;
+}
+
+function inputRowEl(item, s) {
+  const wrap = el("div", "inputrow");
+  const input = el("input");
+  input.type = "password";
+  input.autocomplete = "off";
+  input.placeholder = t.placeholder;
+  input.setAttribute("aria-label", t.inputLabel);
+  const toggle = el("button", null, t.show);
+  toggle.setAttribute("aria-label", t.toggleLabel);
+  toggle.onclick = () => {
+    const shown = input.type === "text";
+    input.type = shown ? "password" : "text";
+    toggle.textContent = shown ? t.show : t.hide;
+  };
+  const send = el("button", "primary", t.send);
+  const run = async () => {
+    if (!s.stdinOpen || s.sending) return;
+    const text = input.value;
+    s.sending = true;
+    send.disabled = true;
+    try {
+      const res = await post(`/api/logins/${item.id}/input`, { text });
+      if (res.ok) {
+        input.value = "";
+        if (loginItem(item.id) && loginItem(item.id).stdin === "line_then_eof") s.stdinOpen = false;
+      } else if (res.status === 409) {
+        const error = await res.json().catch(() => ({}));
+        if (error.error === "stdin_closed") s.stdinOpen = false;
+        else pageError = apiText(error);
+      } else {
+        pageError = t.generic;
+      }
+    } catch {
+      // 网络断了：SSE 的 onerror 会收尾。
+    } finally {
+      s.sending = false;
+      if (pageError !== null) renderAll();
+      else if (s.stdinOpen) { send.disabled = false; input.focus(); }
+      else renderAll();
+    }
+  };
+  send.onclick = run;
+  input.onkeydown = (event) => { if (event.key === "Enter") { event.preventDefault(); run(); } };
+  if (!s.stdinOpen) { input.disabled = true; send.disabled = true; toggle.disabled = true; }
+  wrap.append(input, toggle, send);
+  return wrap;
+}
+
+function cancelEl(item, s) {
+  const button = el("button", "cancel", t.cancel);
+  button.disabled = !!s.cancelling;
+  button.onclick = async () => {
+    s.cancelling = true;
+    button.disabled = true;
+    try {
+      const res = await post(`/api/logins/${item.id}/cancel`, {});
+      if (!res.ok) pageError = t.generic;
+    } catch {
+      // 网络断了：SSE 的 onerror 会收尾。
+    }
+  };
+  return button;
+}
+
+// ---------- 动作 ----------
+
+async function startLogin(id) {
+  let res;
+  try {
+    res = await post(`/api/logins/${id}/start`, {});
+  } catch {
+    return; // 网络断了：刷新看看
+  }
+  if (res.status === 409) {
+    pageError = apiText(await res.json().catch(() => ({})));
+    await refresh();
+    return;
+  }
+  if (!res.ok) {
+    pageError = t.generic;
+    await refresh();
+    return;
+  }
+  openSession(id);
+}
+
+function openSession(id) {
+  const s = { lines: [], rendered: 0, running: true, exit: null, lost: false, stdinOpen: true, es: null, pre: null };
+  sessions.set(id, s);
+  const source = new EventSource(`/api/logins/${id}/events`);
+  s.es = source;
+  source.onmessage = (event) => {
+    let frame;
+    try { frame = JSON.parse(event.data); } catch { return; }
+    if (typeof frame.out === "string") s.lines.push({ kind: "out", text: frame.out });
+    else if (typeof frame.err === "string") s.lines.push({ kind: "err", text: frame.err });
+    else if (typeof frame.exit === "number") return finish(id, frame.exit);
+    else return;
+    appendLines(id);
+  };
+  source.onerror = () => {
+    if (!s.running) return;
+    s.running = false;
+    s.lost = true;
+    source.close();
+    refresh();
+  };
+  renderAll();
+}
+
+function finish(id, exit) {
+  const s = sessions.get(id);
+  s.exit = exit;
+  s.running = false;
+  if (s.es) s.es.close();
+  refresh();
+}
+
+function appendLines(id) {
+  const s = sessions.get(id);
+  if (!s || !s.pre) return;
+  for (const line of s.lines.slice(s.rendered)) s.pre.append(lineEl(line));
+  s.rendered = s.lines.length;
+  s.pre.scrollTop = s.pre.scrollHeight;
+}
+
+refresh();
+</script>
+</body>
+</html>

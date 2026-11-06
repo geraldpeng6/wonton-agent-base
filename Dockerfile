@@ -35,6 +35,7 @@ RUN case "$TARGETARCH" in \
     && chown -R 65532:65532 /data/agent /workspace /data/run
 
 COPY wonton-agent /usr/local/bin/wonton-agent
+COPY web/ /usr/local/share/wonton-agent/web/
 RUN chmod 0755 /usr/local/bin/wonton-agent
 
 ENV HOME=/data/agent/home \

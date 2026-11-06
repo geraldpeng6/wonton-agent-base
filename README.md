@@ -23,6 +23,9 @@ ACP 转发 + 模型网关约定 + 闭源 CLI 首次启动下载。做新 Agent �
 5. **终端登录**（`[[login]]`，可选）：配了才有。initialize 应答里的 authMethods 改写成这些
    终端登录，并在 `<ACP socket 去掉扩展名>.login.sock`（默认 `/data/run/acp.login.sock`）
    跑登录进程；登录成功后入口自己退出，容器按 restart 策略重启，钩子按新登录态重新选路。
+6. **登录网页**（`[web]`，可选）：配了才有。在 `0.0.0.0:<port>` 起一个登录页面，插件清单把
+   它声明成 `webui`（核心网关挡在前面，从 App 的插件页打开）：列出 `[[login]]` 和状态
+   （`status` 命令），点登录看输出、回一行、取消。和登录 socket 共用一把串行锁，一次一个。
 
 socket 在前面几步全部成功之后才建，compose 的健康检查以 socket 文件为准——socket 不存在
 就是还没就绪（首启下载 CLI 可能要几分钟），桥和核心会重试。`[acp]`/`[[login]]` 命令的可执行文件
@@ -103,6 +106,8 @@ stdin = "lines"                        # 缺省 lines：桥发的每行原样转
                                        # 收 key 的 CLI）；桥照旧保持连接收输出。
 restart_on_success = true              # 缺省 true：退出码 0 时回完 exit 帧等 2 秒入口退出，
                                        # 容器按 restart 策略重启，钩子按新登录态重新选路
+status = ["codex", "login", "status"]  # 可选：状态命令，退出码 0 = 已登录，非 0 = 没登录；
+                                       # 登录网页的列表显示用，没写就显示"不确定"，不猜
 ```
 
 入口同时在 `<ACP socket 去掉扩展名>.login.sock`（默认 `/data/run/acp.login.sock`，0600）
@@ -112,6 +117,29 @@ restart_on_success = true              # 缺省 true：退出码 0 时回完 exi
 `{"out"}`/`{"err"}`，输出收完回 `{"exit": 数字}`。桥断开时登录进程被收掉（stdin 关掉等
 2 秒，terminate 2 秒，kill）；登录串行，一次一个。没有 `[[login]]` 时登录 socket 不建，
 Agent 自己的 agent 类登录照旧走 ACP authenticate。
+
+### 登录网页：[web]
+
+不想让主人进容器、也不用把回码贴进聊天：配了 `[web]`，入口在 `0.0.0.0:<port>` 起一个登录
+页面（没有 `[[login]]` 而写了 `[web]` 启动即报错）。插件清单把它声明成 `webui`，核心网关
+挡在前面，只有用户打得开，从 App 的插件页打开：
+
+```yaml
+x-wonton:
+  webui:
+    service: agent
+    port: 8080        # 和 [web] 的 port 一致
+    sso: none         # 网关只校验用户会话，网页不再有自己的登录
+    path: /
+```
+
+页面列出每个 `[[login]]` 和状态：`status` 命令退出码 0 = 已登录、非 0 = 没登录，没写
+`status` 显示"不确定"，起不来或超时（10 秒）算查询出错，原因收进"详情"。点登录起该段的
+`command`：输出逐行显示（去掉配色码，http(s) 链接可点，设备码原样显示），输入框把一行写进
+进程 stdin（`stdin` 模式语义和聊天登录一致），按钮"取消"结束进程；成功且
+`restart_on_success` 时提示 Agent 正在重启。和聊天登录共用一把串行锁，一次一个：有登录
+在进行时按钮不可点，写明"有一个登录正在进行"。输入内容不写进任何日志；健康检查不变
+（仍以 ACP socket 为准）。
 
 
 ## 模型网关钩子
@@ -172,19 +200,21 @@ services:
 
 ## 样例：examples/echo-agent
 
-最小 ACP Agent（回显 prompt）+ `agent.toml` + `Dockerfile`，演示 skill 安装、网关钩子和
-`[[login]]`。本机验证（构建底座和样例、起容器、连 socket 发 `initialize` 和一次
-`session/prompt`，再跑一次样例登录）：
+最小 ACP Agent（回显 prompt）+ `agent.toml` + `Dockerfile`，演示 skill 安装、网关钩子、
+`[[login]]` 和登录网页。本机验证（构建底座和样例、起容器、连 socket 发 `initialize` 和一次
+`session/prompt`，再跑一次样例登录和网页）：
 
 ```sh
 docker build -t ab-agent-base:0.1.0 .
 docker build -t ab-echo-agent:0.1.0 examples/echo-agent \
     --build-arg BASE_IMAGE=ab-agent-base:0.1.0
-docker run -d --name ab-echo-test ab-echo-agent:0.1.0
+docker run -d --name ab-echo-test -p 127.0.0.1::8080 ab-echo-agent:0.1.0
 # 等几秒后连 /data/run/acp.sock 发 ACP 消息，拿回显。
 # 连 /data/run/acp.login.sock 发一行 {"methodId":"sample","args":[],"env":{}} 加一行 key，
 # 拿回 {"out":"logged in"} 和 {"exit":0}；样例 restart_on_success 用缺省 true，
 # 容器随后自己退出（退出码 0）。
+# 登录网页映射在 127.0.0.1 的随机端口上（docker port ab-echo-test 8080 拿到）：
+# curl http://127.0.0.1:<端口>/api/logins 看列表，浏览器打开根路径就是登录页面。
 # 测完 docker rm -f ab-echo-test
 ```
 
@@ -192,7 +222,8 @@ docker run -d --name ab-echo-test ab-echo-agent:0.1.0
 
 - `tests/` 是 Python unittest（只用标准库，不连外网，假 HTTP 服务装包）：配置解析、
   网关 apply/clear、npm 和 URL 两种安装的摘要通过/失败、同版本不重下、socket 往返、
-  登录 socket（lines / line_then_eof / 未知 id / 桥断开收进程 / 成功后入口退出）。
+  登录 socket（lines / line_then_eof / 未知 id / 桥断开收进程 / 成功后入口退出）、
+  登录网页（列表状态 / start→events / input / cancel / 串行拒绝 / 非 JSON 拒绝）。
   `python3 -m unittest discover -s tests -v`
 - 发布：GitHub Actions 手动触发（**发布** → Run workflow），先跑测试再出 amd64+arm64
   镜像，推 `ghcr.io/geraldpeng6/wonton-agent-base:<VERSION>`，版本号在仓库根 `VERSION`。
@@ -205,6 +236,10 @@ docker run -d --name ab-echo-test ab-echo-agent:0.1.0
   的 authMethods 改写、登录 socket 协议、stdin/stdout/stderr 逐行去配色码、串行、成功后
   重启容器——具体命令、stdin 模式、是否重启都由 agent.toml 的 `[[login]]` 声明；底座不
   认识任何一家的登录命令，桥请求里的 `args` 一律忽略。没有 `[[login]]` 时这一切不生效。
+- **登录网页只是聊天登录的另一张脸**：起的是同一段 `command`，走同一把串行锁和会话代码，
+  网页的 start/input/cancel 事件和桥的帧一一对应；底座不学任何一家的登录流程，页面按
+  通用规则渲染（链接可点、设备码不猜）。鉴权靠核心网关（`webui`），底座自己不做用户
+  体系，也不记输入内容。
 - **skill 每次覆盖、不清理旧文件**：HOME 是挂载点，镜像里的内容拷不进去，只能启动时铺；
   照搬 wonton-plugin-codex 的既有行为。
 - **socket 权限 0600**：只有桥和宿主诊断连得上。
