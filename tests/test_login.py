@@ -100,6 +100,14 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await self.stop_serve(serve_task)
 
+    def test_initialize_without_auth_methods_gets_the_logins(self):
+        methods = [{"id": "sample", "name": "S", "type": "terminal", "args": []}]
+        line = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1}})
+        self.assertEqual(json.loads(relay.rewrite_auth_methods(line, methods))["result"]["authMethods"],
+                         methods)
+        other = json.dumps({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s"}})
+        self.assertEqual(relay.rewrite_auth_methods(other, methods), other)
+
     async def test_auth_methods_forwarded_without_login(self):
         serve_task = await self.start_serve(
             {"acp": {"command": [sys.executable, str(ECHO_CHILD), "echo"]}})

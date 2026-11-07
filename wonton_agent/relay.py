@@ -11,15 +11,16 @@ from . import config, login, log, web
 
 
 def rewrite_auth_methods(line: str, methods: list[dict]) -> str:
-    """有 [[login]] 时把 initialize 应答（result 里带 authMethods 的那行）改写成配置的终端登录，
-    其余行原样过（照搬 wonton-plugin-codex 的 rewrite_auth_methods）。改写后的行要补回换行：
-    ACP 和桥都按行读 JSON，丢了行尾对端就一直等。"""
+    """有 [[login]] 时把 initialize 应答改写成配置的终端登录，其余行原样过（照搬
+    wonton-plugin-codex 的 rewrite_auth_methods）。ACP 里 authMethods 可省略（缺省为空），所以
+    带 protocolVersion 的 result 也算 initialize 应答，不然不报登录方式的 Agent 在桥里没有登录入口。
+    改写后的行要补回换行：ACP 和桥都按行读 JSON，丢了行尾对端就一直等。"""
     try:
         message = json.loads(line)
     except ValueError:
         return line
     if isinstance(message, dict) and isinstance(message.get("result"), dict) \
-            and "authMethods" in message["result"]:
+            and ("authMethods" in message["result"] or "protocolVersion" in message["result"]):
         message["result"]["authMethods"] = methods
         return json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n"
     return line
