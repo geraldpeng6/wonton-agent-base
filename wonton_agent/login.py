@@ -14,6 +14,11 @@ from . import config
 # 桥把终端登录的链接和提示原样发进聊天：去掉终端配色码（照搬 wonton-plugin-codex）。
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
+# 输出里有不完整的一行、这么久没有新字节就先把这一段发出（{"out": …}），后面的接着拼：
+# Claude Code 登录打印 "Paste code here if prompted > " 后不换行等输入，按行读会把提示
+# 卡到下一次输出才发。登录 socket 和网页共用这一处读取。
+IDLE_FLUSH = 0.2
+
 # 登录成功回完 exit 帧等这么久再退出入口，让桥收尾；桥断开时 stdin 关掉等这么久，
 # terminate 再等这么久，最后 kill。测试里调短，不必等满 2 秒。
 RESTART_DELAY = 2
@@ -37,7 +42,8 @@ async def send_frame(client: socket.socket, loop: asyncio.AbstractEventLoop, fra
 
 
 class LoginSession:
-    """一次登录进程：起进程、stdout/stderr 每行去配色码放进 frames、写 stdin、收尾。
+    """一次登录进程：起进程、stdout/stderr 去配色码放进 frames（不完整行按 IDLE_FLUSH
+    先发）、写 stdin、收尾。
     frames 依次是 {"out": 行}/{"err": 行}，收完进 {"exit": 数字}；每条入口一个消费方，
     桥这边是 forward_frames，网页那边是 pump_frames。"""
 
@@ -120,8 +126,28 @@ class LoginSession:
             os._exit(0)
 
     async def _pump(self, stream: asyncio.StreamReader, key: str) -> None:
-        while line := await stream.readline():
-            self.frames.put_nowait({key: ANSI.sub("", line.decode(errors="replace")).rstrip("\n")})
+        """stdout/stderr 搬运：完整行照常发；不完整的一行等 IDLE_FLUSH 没有新字节就先发，
+        之后的输出接着这一行拼（帧里不加换行）。EOF 时剩多少发多少。"""
+        pending = b""
+        while True:
+            try:
+                chunk = await asyncio.wait_for(stream.read(64 * 1024), IDLE_FLUSH)
+            except asyncio.TimeoutError:
+                if pending:
+                    self._emit(key, pending)
+                    pending = b""
+                continue
+            if not chunk:
+                break
+            pending += chunk
+            while (newline := pending.find(b"\n")) >= 0:
+                self._emit(key, pending[:newline])
+                pending = pending[newline + 1:]
+        if pending:
+            self._emit(key, pending)
+
+    def _emit(self, key: str, line: bytes) -> None:
+        self.frames.put_nowait({key: ANSI.sub("", line.decode(errors="replace")).rstrip("\n")})
 
 
 async def forward_frames(session: LoginSession, client: socket.socket,
@@ -142,8 +168,9 @@ async def serve_login(listener: socket.socket, logins: list[dict]) -> None:
 
     协议（与桥 login/terminal.rs 约定）：桥先发一行 JSON {"methodId","args","env"}；methodId
     对上哪段 [[login]] 就用哪段的 command 和 stdin 模式（请求里的 args 忽略），env 合并进环境。
-    之后桥发的每行文本写入登录进程 stdin；登录进程的 stdout/stderr 每行去配色码回
-    {"out"}/{"err"}，输出收完回 {"exit": 数字}，0 才算成功。登录串行，一次一个，后来的在
+    之后桥发的每行文本写入登录进程 stdin；登录进程 stdout/stderr 去配色码回
+    {"out"}/{"err"}（不完整的一行等 200 毫秒没有新字节就先发，提示不带换行的 CLI
+    不用等下一次输出），输出收完回 {"exit": 数字}，0 才算成功。登录串行，一次一个，后来的在
     backlog 里等。
     """
     loop = asyncio.get_running_loop()

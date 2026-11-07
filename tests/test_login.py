@@ -194,6 +194,28 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await self.stop_serve(serve_task)
 
+    async def test_partial_line_flushed_before_next_output(self):
+        config = {
+            "acp": {"command": [sys.executable, str(ECHO_CHILD), "echo"]},
+            "login": [{"id": "sample", "name": "样例",
+                       "command": [sys.executable, str(LOGIN_CHILD), "prompt"]}],
+        }
+        serve_task = await self.start_serve(config)
+        try:
+            reader, writer = await self.connect_login()
+            await self.send_request(writer)
+            # 提示不带换行：200ms 没有新字节就要先发出来，1 秒内收到，不等下一次输出。
+            self.assertEqual(await self.read_frame(reader, timeout=1),
+                             {"out": "Paste code here if prompted > "})
+            # 后面的接着拼：回答之后进程回一行、退出，帧里不加换行也不重发提示。
+            writer.write(b"the-key\n")
+            await writer.drain()
+            self.assertEqual(await self.read_frame(reader), {"out": "got:the-key"})
+            self.assertEqual(await self.read_frame(reader), {"exit": 0})
+            writer.close()
+        finally:
+            await self.stop_serve(serve_task)
+
     async def test_unknown_method_id_rejected_and_serial_loop_continues(self):
         config = {
             "acp": {"command": [sys.executable, str(ECHO_CHILD), "echo"]},
