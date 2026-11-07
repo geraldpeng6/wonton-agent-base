@@ -8,6 +8,7 @@
    指定的目录，每次启动覆盖。
 3. [gateway]（可选）：核心注入的 WONTON_MODEL_* 变量都有值时调钩子 apply，任一为空调 clear；
    网关后来就绪时核心会重建容器，钩子在新一轮启动里生效。密钥只引用变量名，不写进文件。
+   [gateway.env]（可选）把映射的变量加进 [acp] 子进程的环境（[[login]] 子进程不加）。
 4. [acp]：在 $WONTON_ACP_SOCKET 上监听，每个连接起一次 ACP 命令（stdio 说 ACP）双向转发，
    连接断了杀掉子进程。转发时去掉终端配色码；子进程 stderr 直接进容器日志。
    socket 在前面几步都成功之后才建，compose 的健康检查以 socket 文件为准，建好之前不过。
@@ -16,7 +17,8 @@
 5. [[login]]（可选，可多段）：终端登录。把 initialize 应答里的 authMethods 改写成这些登录，
    并在 ACP socket 旁边监听 <ACP socket 去掉扩展名>.login.sock：桥连上来发一行
    {"methodId","args","env"}，入口按 agent.toml 里配的命令起登录进程，双向搬运
-   stdin/stdout/stderr（每行去配色码），登录成功后入口自己退出，容器按 restart 策略重启。
+   stdin/stdout/stderr（去配色码，不完整的一行 200ms 没有新字节先发），登录成功后入口
+   自己退出，容器按 restart 策略重启。
 6. [web]（可选）：在 0.0.0.0:<port> 起登录网页（插件清单声明成 webui，核心网关挡在前面，
    从 App 的插件页打开）。页面列出 [[login]] 和状态（[[login]] 的 status 命令，退出码 0 =
    已登录），点登录起同一段命令：输出逐行显示、回一行进 stdin、可取消。和登录 socket 共用

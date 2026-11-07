@@ -16,6 +16,7 @@ AGENT_HOME = Path(os.environ.get("HOME", "/data/agent/home"))
 
 HEX_SHA512 = re.compile(r"[0-9a-fA-F]{128}\Z")
 HEX_SHA256 = re.compile(r"[0-9a-fA-F]{64}\Z")
+ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
 
 def load_config(path: Path = CONFIG_PATH) -> dict:
@@ -38,8 +39,16 @@ def load_config(path: Path = CONFIG_PATH) -> dict:
     for section in ("skills", "prompt"):
         if section in config and not isinstance(config[section].get("target"), str):
             die(f"配置 [{section}] 缺 target（字符串路径）")
-    if "gateway" in config and not isinstance(config["gateway"].get("hook"), str):
-        die("配置 [gateway] 缺 hook（可执行文件路径）")
+    if "gateway" in config:
+        if not isinstance(config["gateway"].get("hook"), str):
+            die("配置 [gateway] 缺 hook（可执行文件路径）")
+        env_map = config["gateway"].get("env", {})
+        if not isinstance(env_map, dict) or not all(
+                isinstance(target, str) and isinstance(source, str)
+                and ENV_NAME.fullmatch(target) and ENV_NAME.fullmatch(source)
+                for target, source in env_map.items()):
+            die('[gateway.env] 必须是 "目标变量 = 来源变量" 的表，'
+                '例如 ANTHROPIC_AUTH_TOKEN = "WONTON_MODEL_API_KEY"')
     return config
 
 

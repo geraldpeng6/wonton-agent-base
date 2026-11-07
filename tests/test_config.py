@@ -98,6 +98,17 @@ class LoadConfigTests(unittest.TestCase):
         _, message = load('[acp]\ncommand = ["x"]\n\n[gateway]\n')
         self.assertIn("hook", message)
 
+    def test_gateway_env_table_accepted(self):
+        config, message = load('[acp]\ncommand = ["x"]\n\n[gateway]\nhook = "/x"\n\n'
+                               '[gateway.env]\nANTHROPIC_AUTH_TOKEN = "WONTON_MODEL_API_KEY"\n')
+        self.assertIsNone(message)
+        self.assertEqual(config["gateway"]["env"], {"ANTHROPIC_AUTH_TOKEN": "WONTON_MODEL_API_KEY"})
+
+    def test_gateway_env_bad_mapping_rejected(self):
+        _, message = load('[acp]\ncommand = ["x"]\n\n[gateway]\nhook = "/x"\n\n'
+                          '[gateway.env]\nANTHROPIC_AUTH_TOKEN = "not a var name"\n')
+        self.assertIn("gateway.env", message)
+
     def test_install_bad_name_rejected(self):
         _, message = load('[acp]\ncommand = ["x"]\n\n[[install]]\nname = "../evil"\nversion = "1"\nsource = "url"\n')
         self.assertIn("name", message)
