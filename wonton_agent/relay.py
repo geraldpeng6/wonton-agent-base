@@ -7,7 +7,7 @@ import shutil
 import socket
 from pathlib import Path
 
-from . import config, login, log, web
+from . import config, gateway, login, log, web
 
 
 def rewrite_auth_methods(line: str, methods: list[dict]) -> str:
@@ -103,6 +103,8 @@ async def serve(cfg: dict) -> None:
     command = cfg["acp"]["command"]
     strip_ansi = cfg["acp"].get("strip_ansi", True)
     methods = config.login_methods(cfg)
+    # [gateway.env] 在监听之前解析：来源变量没值直接报错退出，健康检查不过，别等连接。
+    child_env = {**os.environ, **gateway.acp_env(cfg)}
     # 起不来是子镜像配置坏了：在监听之前就报错，健康检查不过，别等第一个连接才暴露。
     if not shutil.which(command[0]):
         raise RuntimeError(
@@ -146,6 +148,7 @@ async def serve(cfg: dict) -> None:
                     # stderr=None：子进程 stderr 继承容器的，直接进容器日志。
                     stderr=None,
                     cwd=config.WORKSPACE,
+                    env=child_env,
                     # ACP 一行就是一条消息，带上下文块时远超默认的 64KiB。
                     limit=2 ** 24,
                 )

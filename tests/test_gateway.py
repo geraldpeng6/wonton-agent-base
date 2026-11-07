@@ -105,5 +105,53 @@ class GatewayTests(unittest.TestCase):
         agent.apply_gateway({})  # 不该抛错，也不该起进程
 
 
+class AcpEnvTests(unittest.TestCase):
+    """[gateway.env]：网关接好才把映射的变量加进 [acp] 子进程环境，否则不加。"""
+
+    def run_env(self, config: dict, env: dict) -> dict:
+        # 缺省变量显式给空串，和核心注入空值的语义一致（照 GatewayTests.run_gateway）。
+        values = {"WONTON_MODEL_BASE_URL": "", "WONTON_MODEL_API_KEY": "", "WONTON_MODEL_DEFAULT": ""}
+        values.update(env)
+        with mock.patch.dict(os.environ, values):
+            return agent.acp_env(config)
+
+    def test_gateway_ready_maps_variables(self):
+        env = self.run_env(
+            {"gateway": {"hook": "/x", "env": {
+                "ANTHROPIC_AUTH_TOKEN": "WONTON_MODEL_API_KEY",
+                "ANTHROPIC_BASE_URL": "WONTON_MODEL_BASE_URL"}}},
+            {"WONTON_MODEL_BASE_URL": "http://gateway.example.internal/v1",
+             "WONTON_MODEL_API_KEY": "secret", "WONTON_MODEL_DEFAULT": "group/default"})
+        self.assertEqual(env, {"ANTHROPIC_AUTH_TOKEN": "secret",
+                               "ANTHROPIC_BASE_URL": "http://gateway.example.internal/v1"})
+
+    def test_no_gateway_section_maps_nothing(self):
+        env = self.run_env({"acp": {"command": ["x"]}}, {
+            "WONTON_MODEL_BASE_URL": "x", "WONTON_MODEL_API_KEY": "y", "WONTON_MODEL_DEFAULT": "z"})
+        self.assertEqual(env, {})
+
+    def test_gateway_without_env_table_maps_nothing(self):
+        env = self.run_env({"gateway": {"hook": "/x"}}, {
+            "WONTON_MODEL_BASE_URL": "x", "WONTON_MODEL_API_KEY": "y", "WONTON_MODEL_DEFAULT": "z"})
+        self.assertEqual(env, {})
+
+    def test_incomplete_gateway_variables_map_nothing(self):
+        env = self.run_env(
+            {"gateway": {"hook": "/x", "env": {"ANTHROPIC_AUTH_TOKEN": "WONTON_MODEL_API_KEY"}}},
+            {"WONTON_MODEL_BASE_URL": "x", "WONTON_MODEL_API_KEY": "", "WONTON_MODEL_DEFAULT": "z"})
+        self.assertEqual(env, {}, "钩子 clear 时子进程也不注入")
+
+    def test_missing_source_variable_dies(self):
+        # 映射的来源变量没值：配置和实际环境对不上，报错退出，不静默跳过。
+        stderr = StringIO()
+        with redirect_stderr(stderr):
+            with self.assertRaises(SystemExit):
+                self.run_env(
+                    {"gateway": {"hook": "/x", "env": {"ANTHROPIC_AUTH_TOKEN": "AB_NO_SUCH_SOURCE"}}},
+                    {"WONTON_MODEL_BASE_URL": "x", "WONTON_MODEL_API_KEY": "y",
+                     "WONTON_MODEL_DEFAULT": "z"})
+        self.assertIn("AB_NO_SUCH_SOURCE", stderr.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

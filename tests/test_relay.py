@@ -12,6 +12,7 @@ import support
 
 from wonton_agent import config as paths, relay
 ECHO_CHILD = Path(__file__).parent / "echo_child.py"
+LOGIN_CHILD = Path(__file__).parent / "login_child.py"
 
 
 class RelayTests(unittest.IsolatedAsyncioTestCase):
@@ -100,6 +101,41 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
                 self.fail("连接断开后子进程没被杀掉")
         finally:
             await self.stop_serve(serve_task)
+
+    async def test_gateway_env_reaches_acp_subprocess(self):
+        # [gateway.env]：三个网关变量都有值时，映射的目标变量加进 [acp] 子进程环境。
+        config = {
+            "acp": {"command": [sys.executable, str(LOGIN_CHILD), "env", "ANTHROPIC_AUTH_TOKEN"]},
+            "gateway": {"hook": "/usr/local/lib/wonton-agent/gateway",
+                        "env": {"ANTHROPIC_AUTH_TOKEN": "WONTON_MODEL_API_KEY"}},
+        }
+        with mock.patch.dict(os.environ, {
+                "WONTON_MODEL_BASE_URL": "http://gateway.example.internal/v1",
+                "WONTON_MODEL_API_KEY": "secret",
+                "WONTON_MODEL_DEFAULT": "group/default"}):
+            serve_task = await self.start_serve(config)
+            try:
+                reader, writer = await asyncio.open_unix_connection(str(paths.SOCKET))
+                self.assertEqual((await asyncio.wait_for(reader.readline(), 5)).decode().strip(),
+                                 "secret")
+                writer.close()
+            finally:
+                await self.stop_serve(serve_task)
+
+    async def test_acp_subprocess_gets_no_gateway_env_without_gateway(self):
+        # 没接网关就不注入：目标变量在子进程里是 unset，跟环境里有没有 WONTON_MODEL_* 无关。
+        config = {"acp": {"command": [sys.executable, str(LOGIN_CHILD), "env", "ANTHROPIC_AUTH_TOKEN"]}}
+        with mock.patch.dict(os.environ):
+            os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+            os.environ.pop("WONTON_MODEL_API_KEY", None)
+            serve_task = await self.start_serve(config)
+            try:
+                reader, writer = await asyncio.open_unix_connection(str(paths.SOCKET))
+                self.assertEqual((await asyncio.wait_for(reader.readline(), 5)).decode().strip(),
+                                 "unset")
+                writer.close()
+            finally:
+                await self.stop_serve(serve_task)
 
     async def test_spawn_failure_raises(self):
         config = {"acp": {"command": ["/nonexistent/acp-binary"]}}

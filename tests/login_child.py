@@ -4,7 +4,9 @@ echo [n]    收一行回一行 got:<行>，收满 n 行或 stdin EOF 后退出 0
 env NAME    打印环境变量 NAME 的值退出 0（测 env 合并进登录进程）；
 eof         读 stdin 到 EOF，打印 eof:<行数>:<首行> 退出 0（测 line_then_eof 关 stdin）；
 hold PIDFILE  把 pid 写进 PIDFILE 后挂住（测桥断开时登录进程被收掉）；
-exit CODE   以退出码 CODE 退出（测退出码帧和不重启路径）。
+exit CODE   以退出码 CODE 退出（测退出码帧和不重启路径）；
+prompt      打印 "Paste code here if prompted > "（不带换行）后等一行 stdin，回 got:<行>
+            退出 0（测不完整的一行 200ms 无新字节就先发）。
 """
 import os
 import sys
@@ -32,3 +34,9 @@ elif mode == "hold":
     time.sleep(3600)
 elif mode == "exit":
     sys.exit(int(sys.argv[2]))
+elif mode == "prompt":
+    sys.stdout.write("Paste code here if prompted > ")
+    sys.stdout.flush()
+    line = sys.stdin.buffer.readline()
+    sys.stdout.buffer.write(b"got:" + line)
+    sys.stdout.buffer.flush()

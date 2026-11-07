@@ -16,6 +16,9 @@ import support
 
 from wonton_agent import install as agent
 
+# setUp 会把 npm_install 打成桩；这里留一份真函数，测 npm 源的 bin 路径时要真跑 npm。
+real_npm_install = agent.npm_install
+
 npm_calls: list[Path] = []
 
 
@@ -67,6 +70,7 @@ def npm_package_tgz(version: str = "1.0.0") -> bytes:
         (package / "package.json").write_text(
             f'{{"name":"echo","version":"{version}","bin":{{"echo":"bin/echo"}}}}')
         (package / "bin" / "echo").write_text("#!/bin/sh\necho package-echo\n")
+        (package / "bin" / "echo").chmod(0o755)  # 真实 CLI 包的 tarball 自带执行位
         archive = root / f"echo-{version}.tgz"
         with tarfile.open(archive, "w:gz") as tar:
             tar.add(package, arcname="package")
@@ -126,6 +130,27 @@ class InstallTests(unittest.TestCase):
         self.assertTrue(npm_calls[0].is_relative_to(self.tools))
         self.assertIn(".echo-1.0.0.download-", npm_calls[0].name)
         self.assertEqual(registry.requests, ["/@scope/echo/-/echo-1.0.0.tgz"])
+
+    def test_npm_source_cli_lands_at_package_bin_path(self):
+        # CLI 本体在包的 tgz 里，位置跟包里 package.json 的 bin 字段走（这里是 bin/echo）：
+        # 真 npm install 只把依赖装进 node_modules/，不给包自己的 bin 建 node_modules/.bin
+        # 链接。[acp] command 要按包的 bin 字段指到 <版本目录>/bin/<命令>。
+        if shutil.which("npm") is None:
+            self.skipTest("npm 不可用")
+        data = npm_package_tgz()
+        with FakeRegistry({"/@scope/echo/-/echo-1.0.0.tgz": data}) as registry:
+            with mock.patch.object(agent, "npm_install", real_npm_install):
+                # 缓存和更新检查指到临时目录：不碰测试机的 $HOME，也不连外网。
+                with mock.patch.dict(os.environ, {
+                        "npm_config_cache": str(self.tmp / "npm-cache"),
+                        "npm_config_update_notifier": "false"}):
+                    agent.install_tools(self.npm_config(sha512_integrity(data), registry.base))
+        final = self.tools / "echo" / "1.0.0"
+        cli = final / "bin" / "echo"
+        self.assertTrue(cli.is_file(), "CLI 在包的 bin 字段位置（<版本目录>/bin/<命令>）")
+        self.assertTrue(cli.stat().st_mode & 0o111, "tarball 里的执行位要保留")
+        self.assertFalse((final / "node_modules" / ".bin" / "echo").exists(),
+                         "npm install 不搬包自己的 bin")
 
     def test_npm_hex_integrity_accepted(self):
         data = npm_package_tgz()
