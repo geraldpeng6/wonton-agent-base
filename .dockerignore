@@ -1,6 +1,9 @@
-# 构建上下文只需要入口脚本和登录网页的静态文件。
+# 构建上下文只需要入口脚本、包和登录网页的静态文件。
 *
 !wonton-agent
+!wonton_agent/
+!wonton_agent/**
 !web/
 !web/index.html
 !web/tokens.css
+**/__pycache__/

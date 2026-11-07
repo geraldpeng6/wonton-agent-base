@@ -14,7 +14,7 @@ from unittest import mock
 
 import support
 
-agent = support.agent
+from wonton_agent import install as agent
 
 npm_calls: list[Path] = []
 

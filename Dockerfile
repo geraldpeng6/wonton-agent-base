@@ -1,4 +1,4 @@
-# Wonton Agent 插件的共用底座：入口、ACP 转发、网关钩子约定、闭源 CLI 首次启动下载。
+# Wonton Agent 插件的共用底座：入口包（按职责拆模块）、ACP 转发、网关钩子约定、闭源 CLI 首次启动下载。
 # 闭源 CLI 不打进发布的镜像（要跟官方源、按版本和摘要核对），由入口按 agent.toml 在
 # 首次启动时下载到数据卷 /data/agent/tools/。
 FROM public.ecr.aws/docker/library/debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
@@ -35,6 +35,7 @@ RUN case "$TARGETARCH" in \
     && chown -R 65532:65532 /data/agent /workspace /data/run
 
 COPY wonton-agent /usr/local/bin/wonton-agent
+COPY wonton_agent/ /usr/local/lib/wonton-agent/wonton_agent/
 COPY web/ /usr/local/share/wonton-agent/web/
 RUN chmod 0755 /usr/local/bin/wonton-agent
 

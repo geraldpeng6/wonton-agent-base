@@ -7,7 +7,7 @@ from pathlib import Path
 
 import support
 
-agent = support.agent
+from wonton_agent import config as agent
 
 
 def write_config(body: str) -> Path:

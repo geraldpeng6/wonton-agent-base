@@ -11,7 +11,7 @@ from unittest import mock
 
 import support
 
-agent = support.agent
+from wonton_agent import gateway as agent
 
 
 def write_hook(directory: Path, body: str) -> Path:

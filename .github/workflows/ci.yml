@@ -1,0 +1,19 @@
+# push 和 pull_request 都跑：文件和函数长度检查，全量测试。发布工作流跑测试前也先跑检查。
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: 文件和函数长度检查
+        run: python3 scripts/check-size.py
+      - name: 测试
+        run: python3 -m unittest discover -s tests -v

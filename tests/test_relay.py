@@ -10,7 +10,7 @@ from unittest import mock
 
 import support
 
-agent = support.agent
+from wonton_agent import config as paths, relay
 ECHO_CHILD = Path(__file__).parent / "echo_child.py"
 
 
@@ -19,18 +19,18 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="ab-relay-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         patches = [
-            mock.patch.object(agent, "SOCKET", self.tmp / "acp.sock"),
-            mock.patch.object(agent, "WORKSPACE", self.tmp / "workspace"),
-            mock.patch.object(agent, "AGENT_HOME", self.tmp / "home"),
+            mock.patch.object(paths, "SOCKET", self.tmp / "acp.sock"),
+            mock.patch.object(paths, "WORKSPACE", self.tmp / "workspace"),
+            mock.patch.object(paths, "AGENT_HOME", self.tmp / "home"),
         ]
         for patch in patches:
             patch.start()
             self.addCleanup(patch.stop)
 
     async def start_serve(self, config: dict) -> asyncio.Task:
-        serve_task = asyncio.create_task(agent.serve(config))
+        serve_task = asyncio.create_task(relay.serve(config))
         for _ in range(200):
-            if agent.SOCKET.exists():
+            if paths.SOCKET.exists():
                 return serve_task
             if serve_task.done():
                 raise RuntimeError(f"serve 提前退出：{serve_task.exception()}")
@@ -45,8 +45,8 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
     async def test_roundtrip_and_per_connection_process(self):
         serve_task = await self.start_serve({"acp": {"command": [sys.executable, str(ECHO_CHILD), "echo"]}})
         try:
-            reader1, writer1 = await asyncio.open_unix_connection(str(agent.SOCKET))
-            reader2, writer2 = await asyncio.open_unix_connection(str(agent.SOCKET))
+            reader1, writer1 = await asyncio.open_unix_connection(str(paths.SOCKET))
+            reader2, writer2 = await asyncio.open_unix_connection(str(paths.SOCKET))
             pid1 = (await asyncio.wait_for(reader1.readline(), 5)).decode().strip()
             pid2 = (await asyncio.wait_for(reader2.readline(), 5)).decode().strip()
             self.assertRegex(pid1, r"^pid:\d+$")
@@ -68,7 +68,7 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
         config = {"acp": {"command": [sys.executable, str(ECHO_CHILD), "echo"], "strip_ansi": False}}
         serve_task = await self.start_serve(config)
         try:
-            reader, writer = await asyncio.open_unix_connection(str(agent.SOCKET))
+            reader, writer = await asyncio.open_unix_connection(str(paths.SOCKET))
             await asyncio.wait_for(reader.readline(), 5)
             writer.write(b"\x1b[31mred\x1b[0m\n")
             await writer.drain()
@@ -82,7 +82,7 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
         config = {"acp": {"command": [sys.executable, str(ECHO_CHILD), "hold", str(pidfile)]}}
         serve_task = await self.start_serve(config)
         try:
-            reader, writer = await asyncio.open_unix_connection(str(agent.SOCKET))
+            reader, writer = await asyncio.open_unix_connection(str(paths.SOCKET))
             for _ in range(100):
                 if pidfile.exists():
                     break
@@ -104,17 +104,17 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
     async def test_spawn_failure_raises(self):
         config = {"acp": {"command": ["/nonexistent/acp-binary"]}}
         with self.assertRaises(RuntimeError) as caught:
-            await agent.serve(config)
+            await relay.serve(config)
         self.assertIn("/nonexistent/acp-binary", str(caught.exception))
 
     async def test_socket_is_private(self):
         serve_task = await self.start_serve({"acp": {"command": [sys.executable, str(ECHO_CHILD), "echo"]}})
         try:
-            mode = agent.SOCKET.stat().st_mode & 0o777
+            mode = paths.SOCKET.stat().st_mode & 0o777
             self.assertEqual(mode, 0o600, "socket 只有桥和宿主诊断能连")
         finally:
             await self.stop_serve(serve_task)
-            self.assertFalse(agent.SOCKET.exists(), "退出时收掉 socket")
+            self.assertFalse(paths.SOCKET.exists(), "退出时收掉 socket")
 
 
 if __name__ == "__main__":

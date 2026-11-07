@@ -8,7 +8,7 @@ from unittest import mock
 
 import support
 
-agent = support.agent
+from wonton_agent import assets as agent
 
 
 class SkillsTests(unittest.TestCase):

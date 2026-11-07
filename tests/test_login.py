@@ -1,6 +1,6 @@
 """[[login]] 终端登录：authMethods 改写、登录 socket 协议（lines / line_then_eof / 未知 id /
 env 合并）、桥断开收进程、成功后入口退出（os._exit 打成桩，等 2 秒调短）。
-登录进程是 tests/login_child.py，用 agent.serve 真起监听，再连 socket 按桥的协议走。"""
+登录进程是 tests/login_child.py，用 relay.serve 真起监听，再连 socket 按桥的协议走。"""
 import asyncio
 import json
 import os
@@ -13,7 +13,7 @@ from unittest import mock
 
 import support
 
-agent = support.agent
+from wonton_agent import config as paths, login, relay
 ECHO_CHILD = Path(__file__).parent / "echo_child.py"
 LOGIN_CHILD = Path(__file__).parent / "login_child.py"
 
@@ -22,7 +22,7 @@ INITIALIZE_RESULT = json.dumps({
     "result": {"protocolVersion": 1, "authMethods": [{"id": "x", "name": "X", "type": "prompt"}]},
 })
 
-LOGIN_SOCKET = lambda: agent.SOCKET.with_suffix(".login.sock")
+LOGIN_SOCKET = lambda: paths.SOCKET.with_suffix(".login.sock")
 
 
 class LoginTests(unittest.IsolatedAsyncioTestCase):
@@ -30,12 +30,12 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="ab-login-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         patches = [
-            mock.patch.object(agent, "SOCKET", self.tmp / "run" / "acp.sock"),
-            mock.patch.object(agent, "WORKSPACE", self.tmp / "workspace"),
-            mock.patch.object(agent, "AGENT_HOME", self.tmp / "home"),
+            mock.patch.object(paths, "SOCKET", self.tmp / "run" / "acp.sock"),
+            mock.patch.object(paths, "WORKSPACE", self.tmp / "workspace"),
+            mock.patch.object(paths, "AGENT_HOME", self.tmp / "home"),
             # 成功后的重启等待和断连宽限调短，测试不必等满 2 秒。
-            mock.patch.object(agent, "RESTART_DELAY", 0.1),
-            mock.patch.object(agent, "DISCONNECT_GRACE", 0.3),
+            mock.patch.object(login, "RESTART_DELAY", 0.1),
+            mock.patch.object(login, "DISCONNECT_GRACE", 0.3),
         ]
         for patch in patches:
             patch.start()
@@ -45,9 +45,9 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(mock.patch.stopall)
 
     async def start_serve(self, config: dict) -> asyncio.Task:
-        serve_task = asyncio.create_task(agent.serve(config))
+        serve_task = asyncio.create_task(relay.serve(config))
         for _ in range(200):
-            if agent.SOCKET.exists():
+            if paths.SOCKET.exists():
                 return serve_task
             if serve_task.done():
                 raise RuntimeError(f"serve 提前退出：{serve_task.exception()}")
@@ -82,7 +82,7 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
             # 登录 socket 先于 ACP socket 建好，权限 0600。
             self.assertTrue(LOGIN_SOCKET().exists())
             self.assertEqual(LOGIN_SOCKET().stat().st_mode & 0o777, 0o600)
-            reader, writer = await asyncio.open_unix_connection(str(agent.SOCKET))
+            reader, writer = await asyncio.open_unix_connection(str(paths.SOCKET))
             await asyncio.wait_for(reader.readline(), 5)  # echo 子进程先报 pid
             writer.write((INITIALIZE_RESULT + "\n").encode())
             await writer.drain()
@@ -105,7 +105,7 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
             {"acp": {"command": [sys.executable, str(ECHO_CHILD), "echo"]}})
         try:
             self.assertFalse(LOGIN_SOCKET().exists(), "没有 [[login]] 不建登录 socket")
-            reader, writer = await asyncio.open_unix_connection(str(agent.SOCKET))
+            reader, writer = await asyncio.open_unix_connection(str(paths.SOCKET))
             await asyncio.wait_for(reader.readline(), 5)
             writer.write((INITIALIZE_RESULT + "\n").encode())
             await writer.drain()
@@ -264,7 +264,7 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await self.read_frame(reader2), {"exit": 0})
             writer2.close()
             # 非 0 退出码和显式关掉 restart_on_success 都不退出入口。
-            await asyncio.sleep(agent.RESTART_DELAY * 3)
+            await asyncio.sleep(login.RESTART_DELAY * 3)
             self.exit_mock.assert_not_called()
         finally:
             await self.stop_serve(serve_task)

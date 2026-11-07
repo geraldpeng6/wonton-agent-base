@@ -1,12 +1,16 @@
 # wonton-agent-base
 
-Wonton 的 ACP Agent 插件（Codex、omp、Claude Code、Kimi……）共用这个底座镜像：入口脚本 +
-ACP 转发 + 模型网关约定 + 闭源 CLI 首次启动下载。做新 Agent 插件时不再各写一份入口脚本，
-子镜像只写「装哪个 CLI、ACP 怎么启动、网关怎么写」——见 `examples/echo-agent/`，四个文件就能跑。
+Wonton 的 ACP Agent 插件（Codex、omp、Claude Code、Kimi……）共用这个底座镜像：按职责拆开
+的入口包（`wonton_agent/`）+ ACP 转发 + 模型网关约定 + 闭源 CLI 首次启动下载。做新 Agent
+插件时不再各写一份入口脚本，子镜像只写「装哪个 CLI、ACP 怎么启动、网关怎么写」——见
+`examples/echo-agent/`，四个文件就能跑。
 
 ## 每次容器启动，入口做什么
 
-`/usr/local/bin/wonton-agent`（Python 3 标准库）读 `/etc/wonton-agent/agent.toml`，依次：
+`/usr/local/bin/wonton-agent`（Python 3 标准库）只是几行启动壳：把
+`/usr/local/lib/wonton-agent/wonton_agent/` 加进 `sys.path` 再调 `main`。包按职责分模块
+（config、install、assets、gateway、relay、login、web、main），读
+`/etc/wonton-agent/agent.toml`，依次：
 
 1. **按需安装闭源 CLI**（`[install]`，可选）：首次启动从官方源下载到数据卷
    `/data/agent/tools/<名字>/<版本>/`，摘要核对通过才落盘；版本目录已存在就不重下。
@@ -225,8 +229,10 @@ docker run -d --name ab-echo-test -p 127.0.0.1::8080 ab-echo-agent:0.1.0
   登录 socket（lines / line_then_eof / 未知 id / 桥断开收进程 / 成功后入口退出）、
   登录网页（列表状态 / start→events / input / cancel / 串行拒绝 / 非 JSON 拒绝）。
   `python3 -m unittest discover -s tests -v`
-- 发布：GitHub Actions 手动触发（**发布** → Run workflow），先跑测试再出 amd64+arm64
-  镜像，推 `ghcr.io/geraldpeng6/wonton-agent-base:<VERSION>`，版本号在仓库根 `VERSION`。
+- 长度检查：`python3 scripts/check-size.py`（每个 `.py` 和入口 ≤ 800 行、每个函数 ≤ 100 行，
+  超了退出 1）。push/PR 的 `.github/workflows/ci.yml`（长度检查 + 测试）和发布流程都先跑它。
+- 发布：GitHub Actions 手动触发（**发布** → Run workflow），先跑长度检查和测试再出
+  amd64+arm64 镜像，推 `ghcr.io/geraldpeng6/wonton-agent-base:<VERSION>`，版本号在仓库根 `VERSION`。
 
 ## 设计取舍
 

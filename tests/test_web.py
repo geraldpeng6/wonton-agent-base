@@ -1,7 +1,7 @@
 """登录网页：列表状态（已登录 / 没登录 / 不确定 / 查询出错）、start→events 收到输出和结束、
 input 送达（lines 和 line_then_eof）、cancel 收掉进程、串行（第二个 start 被拒，网页能看到
 socket 那边的登录）、POST 只收 JSON。HTTP 走 http.client（能控制 Content-Type、逐行读 SSE），
-asyncio 的活用 agent.serve 真起。"""
+asyncio 的活用 relay.serve 真起。"""
 import asyncio
 import http.client
 import json
@@ -15,7 +15,7 @@ from unittest import mock
 
 import support
 
-agent = support.agent
+from wonton_agent import config as paths, login, relay, web
 LOGIN_CHILD = Path(__file__).parent / "login_child.py"
 
 
@@ -32,15 +32,15 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="ab-web-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         patches = [
-            mock.patch.object(agent, "SOCKET", self.tmp / "run" / "acp.sock"),
-            mock.patch.object(agent, "WORKSPACE", self.tmp / "workspace"),
-            mock.patch.object(agent, "AGENT_HOME", self.tmp / "home"),
+            mock.patch.object(paths, "SOCKET", self.tmp / "run" / "acp.sock"),
+            mock.patch.object(paths, "WORKSPACE", self.tmp / "workspace"),
+            mock.patch.object(paths, "AGENT_HOME", self.tmp / "home"),
             # 成功后的重启等待、断连宽限和状态查询超时调短，测试不必等满。
-            mock.patch.object(agent, "RESTART_DELAY", 0.1),
-            mock.patch.object(agent, "DISCONNECT_GRACE", 0.3),
-            mock.patch.object(agent, "STATUS_TIMEOUT", 0.5),
-            mock.patch.object(agent, "WEB_ROOT", self.tmp / "no-web-root"),
-            mock.patch.object(agent, "WEB_SERVER", None),
+            mock.patch.object(login, "RESTART_DELAY", 0.1),
+            mock.patch.object(login, "DISCONNECT_GRACE", 0.3),
+            mock.patch.object(web, "STATUS_TIMEOUT", 0.5),
+            mock.patch.object(web, "WEB_ROOT", self.tmp / "no-web-root"),
+            mock.patch.object(web, "WEB_SERVER", None),
         ]
         for patch in patches:
             patch.start()
@@ -50,18 +50,18 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         # 中途失败的测试可能留下还在跑的会话：清掉状态、放锁，别毒化后面的测试。
-        agent.ACTIVE_LOGINS.clear()
-        agent.FINISHED_LOGINS.clear()
-        if agent.LOGIN_LOCK is not None and agent.LOGIN_LOCK.locked():
-            agent.LOGIN_LOCK.release()
+        login.ACTIVE_LOGINS.clear()
+        login.FINISHED_LOGINS.clear()
+        if login.LOGIN_LOCK is not None and login.LOGIN_LOCK.locked():
+            login.LOGIN_LOCK.release()
 
     def port(self) -> int:
-        return agent.WEB_SERVER.server_address[1]
+        return web.WEB_SERVER.server_address[1]
 
     async def start_serve(self, config: dict) -> asyncio.Task:
-        serve_task = asyncio.create_task(agent.serve(config))
+        serve_task = asyncio.create_task(relay.serve(config))
         for _ in range(200):
-            if agent.SOCKET.exists() and agent.WEB_SERVER is not None:
+            if paths.SOCKET.exists() and web.WEB_SERVER is not None:
                 return serve_task
             if serve_task.done():
                 raise RuntimeError(f"serve 提前退出：{serve_task.exception()}")
@@ -274,7 +274,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         serve_task = await self.start_serve(config)
         try:
             reader, writer = await asyncio.open_unix_connection(
-                str(agent.SOCKET.with_suffix(".login.sock")))
+                str(paths.SOCKET.with_suffix(".login.sock")))
             writer.write((json.dumps({"methodId": "sample", "args": [], "env": {}}) + "\n").encode())
             await writer.drain()
             for _ in range(200):

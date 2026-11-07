@@ -1,16 +1,5 @@
-"""被测的 wonton-agent 是无后缀脚本，用 SourceFileLoader 装进来给各测试共享。"""
-import importlib.machinery
-import importlib.util
+"""被测代码在 wonton_agent/ 包里：把仓库根插进 sys.path，测试按模块取要测的名字。"""
+import sys
 from pathlib import Path
 
-
-def load_agent_module():
-    script = Path(__file__).resolve().parent.parent / "wonton-agent"
-    loader = importlib.machinery.SourceFileLoader("wonton_agent", str(script))
-    spec = importlib.util.spec_from_loader(loader.name, loader)
-    module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
-    return module
-
-
-agent = load_agent_module()
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
