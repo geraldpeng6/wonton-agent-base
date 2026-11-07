@@ -21,6 +21,8 @@ Wonton 的 ACP Agent 插件（Codex、omp、Claude Code、Kimi……）共用这
 3. **模型网关**（`[gateway]`，可选）：核心总会注入 `WONTON_MODEL_BASE_URL`、
    `WONTON_MODEL_API_KEY`、`WONTON_MODEL_DEFAULT`（没接网关时是空字符串，网关就绪后核心
    重建容器并注入值）。三个变量都有值时调钩子 `apply`，任一为空调 `clear`。
+   `[gateway.env]`（可选）把这些值按 `目标变量 = 来源变量` 加进 `[acp]` 子进程的环境，
+   详见「模型网关钩子」。
 4. **启动 ACP 转发**：在 `$WONTON_ACP_SOCKET`（默认 `/data/run/acp.sock`）监听；每个连接
    起一次 `[acp] command`（stdio 说 ACP）双向转发，连接断了杀掉子进程；转发时去掉终端
    配色码（`[acp] strip_ansi = false` 可关）；子进程 stderr 直接进容器日志。
@@ -50,7 +52,8 @@ package = "@scope/kimi-cli"
 integrity = "sha512-h8Fw1D3l…"
 
 # 来源二：按架构给 URL 加 sha256。format = "binary"（单个可执行文件，缺省）
-# 或 "tgz"（解包安装）。
+# 或 "tgz"（解包安装）。binary 装完是 <版本目录>/<URL 文件名>；tgz 解包到版本目录，
+# 入口路径看包内布局。
 # source = "url"
 # url_amd64  = "https://example.com/kimi-2.4.0-linux-x64"
 # url_arm64  = "https://example.com/kimi-2.4.0-linux-arm64"
@@ -68,12 +71,15 @@ target = "~/.kimi/PROMPT.md"       # 可选：镜像里 prompt.md 拷到这里
 hook = "/usr/local/lib/wonton-agent/gateway"   # 插件自己的可执行文件，收 apply/clear
 
 [acp]
-command = ["/data/agent/tools/kimi/2.4.0/node_modules/.bin/kimi-acp"]
+command = ["/data/agent/tools/kimi/2.4.0/bin/kimi-acp"]   # 跟包里 package.json 的 bin 字段
 strip_ansi = true                  # 缺省 true
 ```
 
-npm 来源解包后会在目录里跑 `npm install --prefix <目录> --ignore-scripts` 装依赖：
-不执行包里的安装脚本，闭源 CLI 的安装代码不碰容器其余部分。integrity 只核对顶层包，
+npm 来源把包的 tgz 解到版本目录，再跑 `npm install --prefix <版本目录> --ignore-scripts`
+装依赖：不执行包里的安装脚本，闭源 CLI 的安装代码不碰容器其余部分。CLI 本体跟着包走，
+在包里 package.json 的 `bin` 字段指向的位置——多数 CLI 包是 `<版本目录>/bin/<命令>`，也有
+顶层入口（`<版本目录>/cli.js`）——`[acp] command` 按包的 bin 字段填。npm install 只把包
+声明的依赖装进 `<版本目录>/node_modules/`，不搬 CLI 自己。integrity 只核对顶层包，
 依赖按包里的 npm-shrinkwrap.json 锁定（没有就按 semver 取当时的版本），挑 CLI 时优先选
 自带 shrinkwrap 或单文件发布的。
 `[install]` 的 name 只允许字母数字点下划线连字符；配置有拼错的段、缺字段、摘要不合法，
@@ -91,8 +97,9 @@ target = "~/.agents/skills"
 
 ### 闭源 CLI：首次启动下载
 
-见上面完整例子。`[acp] command` 直接指向数据卷里的安装位置；容器重建（升级、网关就绪）
-时数据卷还在，不会重下。
+见上面完整例子。`[acp] command` 直接指向数据卷里的安装位置：npm 源跟包的 bin 字段
+（常见 `<版本目录>/bin/<命令>`），url 源 binary 是 `<版本目录>/<URL 文件名>`，tgz 解包
+在 `<版本目录>/` 下、入口看包内布局；容器重建（升级、网关就绪）时数据卷还在，不会重下。
 
 ### 终端登录：[[login]]
 
@@ -117,8 +124,10 @@ status = ["codex", "login", "status"]  # 可选：状态命令，退出码 0 = �
 入口同时在 `<ACP socket 去掉扩展名>.login.sock`（默认 `/data/run/acp.login.sock`，0600）
 监听，协议和桥的约定一致：桥先发一行 `{"methodId","args","env"}`，按 `methodId` 找到
 `[[login]]` 段（请求里的 `args` 忽略，只用配置里的 `command`；`env` 合并进环境）；
-之后桥发的每行文本写进登录进程 stdin，登录进程 stdout/stderr 每行去配色码回
-`{"out"}`/`{"err"}`，输出收完回 `{"exit": 数字}`。桥断开时登录进程被收掉（stdin 关掉等
+之后桥发的每行文本写进登录进程 stdin，登录进程 stdout/stderr 去配色码回
+`{"out"}`/`{"err"}`（不完整的一行等 200 毫秒没有新字节就先发：Claude Code 的
+`Paste code here if prompted > ` 这类不带换行的提示不用等下一次输出），输出收完回
+`{"exit": 数字}`。桥断开时登录进程被收掉（stdin 关掉等
 2 秒，terminate 2 秒，kill）；登录串行，一次一个。没有 `[[login]]` 时登录 socket 不建，
 Agent 自己的 agent 类登录照旧走 ACP authenticate。
 
@@ -156,6 +165,22 @@ x-wonton:
 **密钥规则**：配置里只引用变量名（如 `env_key = "WONTON_MODEL_API_KEY"`），值留在环境变量里；
 Agent 不支持从环境变量读时才把值写进文件，且文件权限 0600。钩子非零退出、不可执行，
 容器启动失败并写明原因。
+
+**Agent 配置不展开 `${VAR}` 时用 `[gateway.env]`**：有的 Agent（Claude Code）的配置文件
+不展开 `${VAR}`，钩子只好把 key 的值写进文件。给 `[gateway]` 加可选的 `env` 表，
+`目标变量 = 来源变量`，网关接好（三个 `WONTON_MODEL_*` 都有值，和钩子 `apply` 同一个条件）
+时底座把解析出来的值加进 `[acp]` 子进程的环境，`[[login]]` 子进程不加；没接网关或变量不全
+（钩子 `clear`）时不加。映射的来源变量没值，入口启动即报错。钩子于是可以只往配置里写
+变量名，key 依旧不落盘：
+
+```toml
+[gateway]
+hook = "/usr/local/lib/wonton-agent/gateway"
+
+[gateway.env]
+ANTHROPIC_AUTH_TOKEN = "WONTON_MODEL_API_KEY"   # 子进程拿到 WONTON_MODEL_API_KEY 的值
+ANTHROPIC_BASE_URL = "WONTON_MODEL_BASE_URL"
+```
 
 ## 子镜像怎么写
 
